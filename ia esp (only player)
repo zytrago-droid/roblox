@@ -5,9 +5,22 @@ local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS        = game:GetService("UserInputService")
 
+-- Attente des prérequis
+if not Players.LocalPlayer then
+    repeat task.wait(0.1) until Players.LocalPlayer
+end
+if not workspace.CurrentCamera then
+    repeat task.wait(0.1) until workspace.CurrentCamera
+end
+if not Drawing or not Drawing.new then
+    warn("[ESP] Drawing API unavailable on this executor. Aborting.")
+    return
+end
+
 local LP  = Players.LocalPlayer
 local Cam = workspace.CurrentCamera
 
+-- Fonctions localisées
 local V2, V3       = Vector2.new, Vector3.new
 local C3RGB        = Color3.fromRGB
 local max          = math.max
@@ -15,7 +28,7 @@ local sqrt         = math.sqrt
 local clock        = os.clock
 
 -- =========================================================
--- CONSTANTES & CONFIG
+-- CONFIG
 -- =========================================================
 local DEFAULT_COL = C3RGB(255, 255, 255)
 local HP_HIGH     = C3RGB(0, 255, 120)
@@ -47,7 +60,7 @@ local Connections = {}
 local function track(c) Connections[#Connections+1] = c; return c end
 
 -- =========================================================
--- DISTANCE CACHE (pré-rempli 0-300m)
+-- DISTANCE CACHE
 -- =========================================================
 local DIST_CACHE = {}
 for i = 0, 300 do DIST_CACHE[i] = i .. "m" end
@@ -87,7 +100,6 @@ local function resolveTeam(plr)
         local tc = plr.TeamColor
         return t.Name, tc and tc.Color or hashToColor(t.Name)
     end
-    -- attributs player
     for _, attrName in ipairs(TEAM_ATTRS) do
         local ok, v = pcall(function() return plr:GetAttribute(attrName) end)
         if ok and v ~= nil then
@@ -95,7 +107,6 @@ local function resolveTeam(plr)
             return s, hashToColor(s)
         end
     end
-    -- StringValue dans player puis character (pas de table allouée)
     for _, childName in ipairs(TEAM_CHILDREN) do
         local obj = plr:FindFirstChild(childName)
         if obj and obj:IsA("StringValue") and obj.Value ~= "" then
@@ -154,10 +165,10 @@ local function resetObj(o)
 end
 
 local function removeObj(o)
-    o.bg:Remove()
-    o.l1:Remove()
-    o.l2:Remove()
-    o.l3:Remove()
+    pcall(function() o.bg:Remove() end)
+    pcall(function() o.l1:Remove() end)
+    pcall(function() o.l2:Remove() end)
+    pcall(function() o.l3:Remove() end)
 end
 
 local cache, freePool = {}, {}
@@ -195,7 +206,7 @@ local function textWidth(t, fallback)
 end
 
 -- =========================================================
--- RESOLVE CHARACTER (simplifié : head.Parent suffit)
+-- RESOLVE CHARACTER
 -- =========================================================
 local function resolveChar(plr, o)
     local char = plr.Character
@@ -219,7 +230,7 @@ local function hideAll(o)
 end
 
 -- =========================================================
--- RENDER ONE (appel direct, pas de pcall interne)
+-- RENDER ONE
 -- =========================================================
 local function renderOne(plr, vp, camPos, now)
     local o = getObjs(plr)
@@ -295,7 +306,7 @@ local function renderOne(plr, vp, camPos, now)
 end
 
 -- =========================================================
--- PLAYER LIST (pré-allouée)
+-- PLAYER LIST
 -- =========================================================
 local playerList = table.create(30)
 local function rebuildPlayerList()
@@ -321,7 +332,7 @@ local function shutdown()
 end
 
 -- =========================================================
--- MAIN LOOP — try/catch une fois par frame max
+-- MAIN LOOP
 -- =========================================================
 local RENDER_ERR_LOGGED = false
 
@@ -330,25 +341,36 @@ track(RunService.Heartbeat:Connect(function()
         if not SHUTDOWN then for _, o in pairs(cache) do hideAll(o) end end
         return
     end
+    
+    -- Camera guard (respawn, cutscene)
+    if not Cam then
+        Cam = workspace.CurrentCamera
+        if not Cam then return end
+    end
 
     local now    = clock()
     local camPos = Cam.CFrame.Position
     local vp     = Cam.ViewportSize
 
     profileBegin("ESP_Render")
-    for i = 1, #playerList do
-        local plr = playerList[i]
-        if plr and plr.Parent then
-            renderOne(plr, vp, camPos, now)
+    
+    -- pcall global par frame (1 seul pcall, pas 20)
+    local ok, err = pcall(function()
+        for i = 1, #playerList do
+            local plr = playerList[i]
+            if plr and plr.Parent then
+                renderOne(plr, vp, camPos, now)
+            end
         end
-    end
+    end)
+    
     profileEnd()
-end))
 
--- wrapper pour catch silencieux d'une seule erreur dans renderOne
--- (aucun pcall dans la boucle, on prend le risque assumé)
--- Si tu veux zéro risque : entoure le for d'un pcall global unique :
--- local ok, err = pcall(function() for i=1,#playerList do renderOne(...) end end)
+    if not ok and not RENDER_ERR_LOGGED then
+        RENDER_ERR_LOGGED = true
+        warn("[ESP] render error: " .. tostring(err))
+    end
+end))
 
 -- =========================================================
 -- LIFECYCLE
@@ -369,6 +391,9 @@ track(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
     if workspace.CurrentCamera then Cam = workspace.CurrentCamera end
 end))
 
+-- =========================================================
+-- INPUT
+-- =========================================================
 track(UIS.InputBegan:Connect(function(input, gp)
     if gp then return end
     if SHUTDOWN then return end
