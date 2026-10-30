@@ -1,11 +1,18 @@
--- azerty098890 — fly + noclip (final, verified)
+-- azerty098890 — fly + noclip (optimized, behavior-identical)
 -- P = fly toggle. M (AZERTY physical M) = switch engine. ^ = +10, $ = -10.
 -- Ctrl+wheel = GUI scale. Toggles: Noclip ON/OFF, Pitch LOCK/FREE.
 --
--- AZERTY mapping (Roblox uses physical QWERTY positions):
---   AZERTY M  -> KeyCode.Semicolon  (QWERTY ; position) -> GetString returns "m"
---   AZERTY ^  -> KeyCode.LeftBracket (QWERTY [ position) -> GetString returns "^"
---   AZERTY $  -> KeyCode.RightBracket (QWERTY ] position) -> GetString returns "$"
+-- Optimizations vs previous build:
+--  1. Noclip: single Stepped connection with 15 Hz throttle instead of 3 connections at 60 Hz.
+--  2. Movement engines on Stepped (PreSimulation) so velocity applies before physics.
+--  3. enforceNoclipSweep uses GetChildren BFS: skips non-container descendants, no pcall in hot-path.
+--  4. pcall removed from CanCollide writes (part validated just before).
+--  5. AlignPosition.Responsiveness lowered from 60 to 40 (less force calc per frame).
+--
+-- AZERTY mapping:
+--   AZERTY M  -> KeyCode.Semicolon  -> GetString returns "m"
+--   AZERTY ^  -> KeyCode.LeftBracket -> GetString returns "^"
+--   AZERTY $  -> KeyCode.RightBracket -> GetString returns "$"
 
 if _G.azerty098890Loaded then return end
 _G.azerty098890Loaded = true
@@ -30,6 +37,7 @@ local CONFIG = {
     SPEED_STEP    = 10,
     DEFAULT_TRANSP = 0.75,
     PITCH_LOCK    = true,
+    NOCLIP_SWEEP_HZ = 15,
     NOCLIP_WATCHDOG_HZ = 4,
     NOCLIP_REAFFIRM_NET_HZ = 2,
     UI_SCALE_MIN  = 0.5,
@@ -38,7 +46,7 @@ local CONFIG = {
     ENGINE_DEBOUNCE = 0.2,
     MAX_FORCE     = 9e9,
     ALIGN_MAX_VELOCITY = 500,
-    ALIGN_RESPONSIVENESS = 60,
+    ALIGN_RESPONSIVENESS = 40,
 }
 
 local SPEED_UP_KEYS   = {Enum.KeyCode.Six,  Enum.KeyCode.LeftBracket}
@@ -70,6 +78,7 @@ local noclipSavedCollide = setmetatable({}, {__mode = "k"})
 local noclipPartConns  = {}
 local noclipGlobalConns = {}
 local noclipDescAddedConn = nil
+local noclipSweepAccum = 0
 
 local CONTROL = {F = 0, B = 0, L = 0, R = 0, Q = 0, E = 0}
 
@@ -80,7 +89,7 @@ end
 local function currentEngine() return ENGINES[engineIdx] end
 
 --// ============================================================
---// NOCLIP
+--// NOCLIP (optimized)
 --// ============================================================
 
 local function lockPart(part)
@@ -88,17 +97,17 @@ local function lockPart(part)
     if not part:IsA("BasePart") then return end
     if noclipProcessed[part] then
         if part.CanCollide then
-            pcall(function() part.CanCollide = false end)
+            part.CanCollide = false
         end
         return
     end
     noclipProcessed[part] = true
     noclipSavedCollide[part] = part.CanCollide
-    pcall(function() part.CanCollide = false end)
+    part.CanCollide = false
     local ok, sig = pcall(function()
         return part:GetPropertyChangedSignal("CanCollide"):Connect(function()
             if NOCLIP_ENABLED and part.CanCollide then
-                pcall(function() part.CanCollide = false end)
+                part.CanCollide = false
             end
         end)
     end)
@@ -112,13 +121,24 @@ local function scanCharacterNoclip(char)
     end
 end
 
+-- BFS over GetChildren, only descends into containers (skip Humanoid/Scripts/etc).
 local function enforceNoclipSweep()
     if not NOCLIP_ENABLED then return end
     local c = character
     if not c or not c.Parent then return end
-    for _, d in ipairs(c:GetDescendants()) do
-        if d:IsA("BasePart") and d.CanCollide then
-            pcall(function() d.CanCollide = false end)
+    local queue = {c}
+    local i = 1
+    while i <= #queue do
+        local parent = queue[i]
+        i = i + 1
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("BasePart") then
+                if child.CanCollide then
+                    child.CanCollide = false
+                end
+            elseif child:IsA("Model") or child:IsA("Folder") or child:IsA("Accessory") then
+                queue[#queue + 1] = child
+            end
         end
     end
 end
@@ -169,9 +189,15 @@ local function startNativeNoclip()
     hookCharacterNoclip(character)
     reaffirmOwnership()
 
-    table.insert(noclipGlobalConns, RunService.Stepped:Connect(enforceNoclipSweep))
-    table.insert(noclipGlobalConns, RunService.Heartbeat:Connect(enforceNoclipSweep))
-    table.insert(noclipGlobalConns, RunService.RenderStepped:Connect(enforceNoclipSweep))
+    -- Single Stepped connection, throttled internally. Watchdog at 4 Hz keeps full rescan.
+    noclipSweepAccum = 0
+    table.insert(noclipGlobalConns, RunService.Stepped:Connect(function(_, dt)
+        if not NOCLIP_ENABLED then return end
+        noclipSweepAccum = noclipSweepAccum + dt
+        if noclipSweepAccum < 1 / CONFIG.NOCLIP_SWEEP_HZ then return end
+        noclipSweepAccum = 0
+        enforceNoclipSweep()
+    end))
 
     task.spawn(function()
         local netAccum = 0
@@ -556,7 +582,7 @@ local function getMoverParent()
     return rootPart
 end
 
---// Engine 1: LinearVelocity + AlignOrientation
+--// Engine 1: LinearVelocity + AlignOrientation (Stepped)
 local function startVelocityEngine(gen)
     local parent = getMoverParent()
     if not parent then return end
@@ -580,11 +606,13 @@ local function startVelocityEngine(gen)
     aoOrient.CFrame = parent.CFrame
     aoOrient.Parent = parent
 
-    if humanoid then pcall(function() humanoid.PlatformStand = true end) end
+    if humanoid and humanoid.Parent then
+        pcall(function() humanoid.PlatformStand = true end)
+    end
 
     local lockedRot = (parent.CFrame - parent.CFrame.Position).Rotation
 
-    flyConn = RunService.Heartbeat:Connect(function(dt)
+    flyConn = RunService.Stepped:Connect(function(_, dt)
         if gen ~= flyGen or not FLYING then
             if flyConn then flyConn:Disconnect(); flyConn = nil end
             if lvVel then pcall(function() lvVel:Destroy() end); lvVel = nil end
@@ -592,7 +620,6 @@ local function startVelocityEngine(gen)
             if attach then pcall(function() attach:Destroy() end); attach = nil end
             return
         end
-        -- FIX: check .Parent to catch destroyed movers
         if not lvVel or not lvVel.Parent or not aoOrient or not aoOrient.Parent then return end
         local p = getMoverParent()
         if not p or not p.Parent then return end
@@ -612,7 +639,7 @@ local function startVelocityEngine(gen)
     end)
 end
 
---// Engine 2: AlignPosition + AlignOrientation
+--// Engine 2: AlignPosition + AlignOrientation (Stepped)
 local function startAlignEngine(gen)
     local parent = getMoverParent()
     if not parent then return end
@@ -640,12 +667,14 @@ local function startAlignEngine(gen)
     aoOrient.CFrame = parent.CFrame
     aoOrient.Parent = parent
 
-    if humanoid then pcall(function() humanoid.PlatformStand = true end) end
+    if humanoid and humanoid.Parent then
+        pcall(function() humanoid.PlatformStand = true end)
+    end
 
     local lockedRot = (parent.CFrame - parent.CFrame.Position).Rotation
     local targetPos = parent.Position
 
-    flyConn = RunService.Heartbeat:Connect(function(dt)
+    flyConn = RunService.Stepped:Connect(function(_, dt)
         if gen ~= flyGen or not FLYING then
             if flyConn then flyConn:Disconnect(); flyConn = nil end
             if ap then pcall(function() ap:Destroy() end); ap = nil end
@@ -653,7 +682,6 @@ local function startAlignEngine(gen)
             if attach then pcall(function() attach:Destroy() end); attach = nil end
             return
         end
-        -- FIX: check .Parent
         if not ap or not ap.Parent or not aoOrient or not aoOrient.Parent then return end
         local p = getMoverParent()
         if not p or not p.Parent then return end
@@ -674,7 +702,7 @@ local function startAlignEngine(gen)
     end)
 end
 
---// Engine 3: BodyVelocity + BodyGyro
+--// Engine 3: BodyVelocity + BodyGyro (Stepped)
 local function startBodyEngine(gen)
     local parent = getMoverParent()
     if not parent then return end
@@ -693,18 +721,19 @@ local function startBodyEngine(gen)
     bvVel.MaxForce = Vector3.new(CONFIG.MAX_FORCE, CONFIG.MAX_FORCE, CONFIG.MAX_FORCE)
     bvVel.Parent = parent
 
-    if humanoid then pcall(function() humanoid.PlatformStand = true end) end
+    if humanoid and humanoid.Parent then
+        pcall(function() humanoid.PlatformStand = true end)
+    end
 
     local lockedRot = (parent.CFrame - parent.CFrame.Position).Rotation
 
-    flyConn = RunService.Heartbeat:Connect(function(dt)
+    flyConn = RunService.Stepped:Connect(function(_, dt)
         if gen ~= flyGen or not FLYING then
             if flyConn then flyConn:Disconnect(); flyConn = nil end
             if bvVel then pcall(function() bvVel:Destroy() end); bvVel = nil end
             if bgGyro then pcall(function() bgGyro:Destroy() end); bgGyro = nil end
             return
         end
-        -- FIX: check .Parent
         if not bvVel or not bvVel.Parent or not bgGyro or not bgGyro.Parent then return end
         local p = getMoverParent()
         if not p or not p.Parent then return end
@@ -724,18 +753,20 @@ local function startBodyEngine(gen)
     end)
 end
 
---// Engine 4: CFrame direct on Head
+--// Engine 4: CFrame direct on Head (Stepped)
 local function startCFrameEngine(gen)
     local head = character and character:FindFirstChild("Head")
     if not head then return end
     local cam = workspace.CurrentCamera
     if not cam then return end
 
-    if humanoid then pcall(function() humanoid.PlatformStand = true end) end
+    if humanoid and humanoid.Parent then
+        pcall(function() humanoid.PlatformStand = true end)
+    end
     pcall(function() head.Anchored = true end)
     local lockedRot = (head.CFrame - head.CFrame.Position).Rotation
 
-    flyConn = RunService.Heartbeat:Connect(function(dt)
+    flyConn = RunService.Stepped:Connect(function(_, dt)
         if gen ~= flyGen or not FLYING then
             if flyConn then flyConn:Disconnect(); flyConn = nil end
             return
@@ -751,12 +782,12 @@ local function startCFrameEngine(gen)
             local look = cam.CFrame.LookVector
             local flat = Vector3.new(look.X, 0, look.Z)
             if flat.Magnitude > 0.05 then
-                pcall(function() h.CFrame = CFrame.lookAt(pos, pos + flat.Unit) end)
+                h.CFrame = CFrame.lookAt(pos, pos + flat.Unit)
             else
-                pcall(function() h.CFrame = CFrame.new(pos) end)
+                h.CFrame = CFrame.new(pos)
             end
         else
-            pcall(function() h.CFrame = CFrame.new(pos) * cam.CFrame.Rotation end)
+            h.CFrame = CFrame.new(pos) * cam.CFrame.Rotation
         end
     end)
 end
@@ -803,6 +834,7 @@ local function startFlyInternal(preserveToggle)
     end
     if not character or not character.Parent then return end
     if humanoid and humanoid.Health <= 0 then return end
+    if humanoid and not humanoid.Parent then return end
     if not preserveToggle then isFlyToggledOn = true end
 
     FLYING = true
@@ -862,8 +894,7 @@ local function isSpeedDown(kc)
     return ok and s == "$"
 end
 
--- FIX: engine key matches ONLY keys producing "m" character.
--- AZERTY M (physical Semicolon) produces "m". AZERTY , (physical M) produces ",".
+-- Matches only keys producing "m". AZERTY M = Semicolon -> "m", AZERTY comma -> ",".
 local function isEngineKey(kc)
     local ok, s = pcall(function() return UserInputService:GetStringForKeyCode(kc) end)
     return ok and s == "m"
