@@ -1,0 +1,760 @@
+-- --!native
+-- (décommenter UNIQUEMENT si l'executor supporte. si crash au load, garder commenté.)
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+local Workspace  = game:GetService("Workspace")
+
+if not Players.LocalPlayer then repeat task.wait(0.1) until Players.LocalPlayer end
+if not Workspace.CurrentCamera then repeat task.wait(0.1) until Workspace.CurrentCamera end
+if not Drawing or not Drawing.new then warn("[ESP] Drawing unavailable. Abort.") return end
+
+local LP  = Players.LocalPlayer
+local Cam = Workspace.CurrentCamera
+
+local V2, V3       = Vector2.new, Vector3.new
+local C3RGB        = Color3.fromRGB
+local max          = math.max
+local sqrt         = math.sqrt
+local clock        = os.clock
+
+-- =========================================================
+-- CONFIG
+-- =========================================================
+local DEFAULT_COL = C3RGB(255, 255, 255)
+local NPC_COL     = C3RGB(255, 170, 0)
+local OBJECT_COL  = C3RGB(255, 200, 60)
+local HP_HIGH     = C3RGB(0, 255, 120)
+local HP_MED      = C3RGB(255, 200, 50)
+local HP_LOW      = C3RGB(255, 60, 60)
+local TOOL_COL    = C3RGB(255, 220, 150)
+local BG_COL      = C3RGB(0, 0, 0)
+local OUTLINE_COL = C3RGB(0, 0, 0)
+
+local FONT_SIZE   = 13
+local LINE_H      = 15
+local PAD         = 3
+local T_TEXT      = 0.15
+local MARGIN      = 200
+local MAX_DIST_SQ = 1500 * 1500
+local MAX_NPC_RENDER = 20          -- Réduit de 30 à 20
+local MAX_OBJ_RENDER = 30          -- Réduit de 40 à 30
+local NPC_SORT_INTERVAL = 0.5
+local NPC_SCAN_INTERVAL = 30
+local DEAD_FRAME_SKIP = 3          -- Skip 2 frames sur 3 quand mort
+local ARM_DELAY = 3
+
+local ENABLED    = true
+local SHUTDOWN   = false
+local TOGGLE_KEY = Enum.KeyCode.RightShift
+local CLOSE_KEY  = Enum.KeyCode.End
+
+local profileBegin = (debug and debug.profilebegin) or function() end
+local profileEnd   = (debug and debug.profileend)   or function() end
+
+local Connections = {}
+local function track(c) Connections[#Connections+1] = c; return c end
+
+-- =========================================================
+-- FILTRES PROPS
+-- =========================================================
+local PLAYER_FOLDERS = {
+    "PlayerObjects","PlayerProps","PlayerItems",
+    "PlacedObjects","PlacedProps","PlacedItems",
+    "PlayerPlots","PlayerHouses","Plots",
+    "DroppedItems","MoneyPrinters","PlayerPrinters",
+}
+local OWNER_ATTRS    = {"Owner","PlacedBy","Creator","PlacedByUserId","OwnerId","PlacedByPlayer"}
+local OWNER_CHILDREN = {"Owner","PlacedBy","Creator"}
+local NAME_FILTER    = {"printer","money","cash","generator","drop","safe","vault","atm","crate","bag","console","placed"}
+
+-- =========================================================
+-- DIST CACHE
+-- =========================================================
+local DIST_CACHE = {}
+for i = 0, 300 do DIST_CACHE[i] = i .. "m" end
+local function distStr(d)
+    local i = d // 1
+    local s = DIST_CACHE[i]
+    if not s then
+        s = i .. "m"
+        if i < 2000 then DIST_CACHE[i] = s end
+    end
+    return s
+end
+
+-- =========================================================
+-- TEAM
+-- =========================================================
+local function hashToColor(str)
+    local h = 0
+    for i = 1, #str do h = (h * 31 + str:byte(i)) % 16777216 end
+    local r = h // 65536 % 256
+    local g = h // 256 % 256
+    local b = h % 256
+    if r + g + b < 300 then
+        r = (r + 100 > 255) and 255 or r + 100
+        g = (g + 100 > 255) and 255 or g + 100
+        b = (b + 100 > 255) and 255 or b + 100
+    end
+    return C3RGB(r, g, b)
+end
+
+local TEAM_ATTRS    = {"Team","Job","Role","Class"}
+local TEAM_CHILDREN = {"Team","Job","Role","Class","Occupation"}
+
+local function resolveTeam(plr)
+    local t = plr.Team
+    if t then
+        local tc = plr.TeamColor
+        return t.Name, tc and tc.Color or hashToColor(t.Name)
+    end
+    for _, attrName in ipairs(TEAM_ATTRS) do
+        local ok, v = pcall(function() return plr:GetAttribute(attrName) end)
+        if ok and v ~= nil then
+            local s = tostring(v)
+            return s, hashToColor(s)
+        end
+    end
+    for _, childName in ipairs(TEAM_CHILDREN) do
+        local obj = plr:FindFirstChild(childName)
+        if obj and obj:IsA("StringValue") and obj.Value ~= "" then
+            return obj.Value, hashToColor(obj.Value)
+        end
+        local char = plr.Character
+        if char then
+            local obj2 = char:FindFirstChild(childName)
+            if obj2 and obj2:IsA("StringValue") and obj2.Value ~= "" then
+                return obj2.Value, hashToColor(obj2.Value)
+            end
+        end
+    end
+    return nil, nil
+end
+
+-- =========================================================
+-- DRAWING BUILD
+-- =========================================================
+local BUILD_FAILED = false
+local BUILD_FAILED_AT = 0
+local BUILD_RETRY_AFTER = 5
+
+local function newDraw(cls)
+    local ok, o = pcall(Drawing.new, cls)
+    return ok and o or nil
+end
+
+local function buildObjs()
+    if BUILD_FAILED and (clock() - BUILD_FAILED_AT) < BUILD_RETRY_AFTER then return nil end
+    local bg = newDraw("Square")
+    local l1 = newDraw("Text")
+    local l2 = newDraw("Text")
+    local l3 = newDraw("Text")
+    if not (bg and l1 and l2 and l3) then BUILD_FAILED = true; BUILD_FAILED_AT = clock(); return nil end
+    BUILD_FAILED = false
+    bg.Filled = true; bg.Color = BG_COL; bg.Transparency = 0.5; bg.Visible = false
+    for _, t in ipairs({l1, l2, l3}) do
+        t.Center = true; t.Outline = true; t.OutlineColor = OUTLINE_COL
+        t.Size = FONT_SIZE; t.Visible = false
+    end
+    pcall(function()
+        if Drawing.Fonts then
+            local f = Drawing.Fonts.Plex or Drawing.Fonts.System
+            if f then l1.Font = f; l2.Font = f; l3.Font = f end
+        end
+    end)
+    return {
+        bg=bg, l1=l1, l2=l2, l3=l3,
+        char=nil, head=nil, hrp=nil, hum=nil, isNPC=false, isObject=false, plr=nil,
+        teamName=nil, teamCol=nil, lastTeam=nil,
+        tText=0, lastTool=nil, bw=nil, blockH=0, visible=false,
+    }
+end
+
+local function resetObj(o)
+    o.char=nil; o.head=nil; o.hrp=nil; o.hum=nil
+    o.isNPC=false; o.isObject=false; o.plr=nil
+    o.teamName=nil; o.teamCol=nil; o.lastTeam=nil
+    o.tText=0; o.lastTool=nil; o.bw=nil; o.blockH=0; o.visible=false
+    o.bg.Visible=false; o.l1.Visible=false; o.l2.Visible=false; o.l3.Visible=false
+end
+
+local function removeObj(o)
+    pcall(function() o.bg:Remove() end)
+    pcall(function() o.l1:Remove() end)
+    pcall(function() o.l2:Remove() end)
+    pcall(function() o.l3:Remove() end)
+end
+
+local cache, freePool = {}, {}
+
+local function getObjs(key)
+    local o = cache[key]
+    if o then return o end
+    local n = #freePool
+    if n > 0 then
+        o = freePool[n]; freePool[n] = nil; resetObj(o)
+    else
+        o = buildObjs()
+    end
+    if o then cache[key] = o end
+    return o
+end
+
+-- =========================================================
+-- TEXT WIDTH
+-- =========================================================
+local TEXT_BOUNDS_OK = nil
+local function textWidth(t, fallback)
+    if not t then return fallback end
+    if TEXT_BOUNDS_OK == false then return fallback end
+    if TEXT_BOUNDS_OK == nil then
+        local ok, tb = pcall(function() return t.TextBounds end)
+        if ok and tb and tb.X and tb.X > 0 then
+            TEXT_BOUNDS_OK = true; return tb.X
+        end
+        TEXT_BOUNDS_OK = false; return fallback
+    end
+    local tb = t.TextBounds
+    if tb and tb.X and tb.X > 0 then return tb.X end
+    return fallback
+end
+
+-- =========================================================
+-- VALIDATION
+-- =========================================================
+local function isInPlayerFolder(inst)
+    local p = inst.Parent
+    while p and p ~= Workspace do
+        for _, name in ipairs(PLAYER_FOLDERS) do
+            if p.Name == name then return true end
+        end
+        p = p.Parent
+    end
+    return false
+end
+
+local function hasOwnerAttribution(inst)
+    for _, attrName in ipairs(OWNER_ATTRS) do
+        if inst:GetAttribute(attrName) ~= nil then return true end
+    end
+    for _, childName in ipairs(OWNER_CHILDREN) do
+        local c = inst:FindFirstChild(childName)
+        if c and (c:IsA("StringValue") or c:IsA("ObjectValue") or c:IsA("IntValue")) then
+            return true
+        end
+    end
+    return false
+end
+
+local function matchesName(inst)
+    local n = inst.Name:lower()
+    for _, kw in ipairs(NAME_FILTER) do
+        if n:find(kw) then return true end
+    end
+    return false
+end
+
+local function getRootPart(inst)
+    if inst:IsA("BasePart") then return inst end
+    if inst:IsA("Model") then
+        return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart")
+    end
+    return nil
+end
+
+local function isValidPlayerObject(inst)
+    if not (inst:IsA("Model") or inst:IsA("BasePart")) then return false end
+    if inst:FindFirstChildOfClass("Humanoid") then return false end
+    if Players:GetPlayerFromCharacter(inst) then return false end
+    local lpChar = LP.Character
+    if lpChar and inst:IsDescendantOf(lpChar) then return false end
+    local inFolder = isInPlayerFolder(inst)
+    local hasOwner = hasOwnerAttribution(inst)
+    if not inFolder and not hasOwner then return false end
+    if not inFolder and not matchesName(inst) then return false end
+    return getRootPart(inst) ~= nil
+end
+
+local function isValidNPC(model)
+    if not model or not model:IsA("Model") then return false end
+    if model == LP.Character then return false end
+    if Players:GetPlayerFromCharacter(model) then return false end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    if not (model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")) then return false end
+    local n = model.Name:lower()
+    if n:find("vfx") or n:find("effect") or n:find("particle") then return false end
+    local ok, size = pcall(function() return model:GetExtentsSize().Magnitude end)
+    if ok and (size < 6 or size > 120) then return false end
+    return true
+end
+
+-- =========================================================
+-- LISTES
+-- =========================================================
+local playerList = {}
+local npcList    = {}
+local npcMap     = {}
+local objList    = {}
+local objMap     = {}
+
+local function rebuildPlayerList()
+    table.clear(playerList)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then playerList[#playerList+1] = plr end
+    end
+end
+
+local function addNPC(model)
+    if npcMap[model] then return end
+    local hum  = model:FindFirstChildOfClass("Humanoid")
+    local head = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+    local hrp  = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+    if not hum or not head or not hrp then return end
+    local e = {model=model, head=head, hrp=hrp, hum=hum, isNPC=true, isObject=false}
+    npcMap[model] = e
+    npcList[#npcList+1] = e
+end
+
+local function removeNPC(model)
+    local e = npcMap[model]
+    if not e then return end
+    npcMap[model] = nil
+    for i = #npcList, 1, -1 do
+        if npcList[i] == e then npcList[i] = npcList[#npcList]; npcList[#npcList] = nil; break end
+    end
+end
+
+local function addObject(inst)
+    if objMap[inst] then return end
+    local root = getRootPart(inst)
+    if not root then return end
+    local e = {model=inst, head=root, hrp=root, isNPC=false, isObject=true}
+    objMap[inst] = e
+    objList[#objList+1] = e
+end
+
+local function removeObject(inst)
+    local e = objMap[inst]
+    if not e then return end
+    objMap[inst] = nil
+    for i = #objList, 1, -1 do
+        if objList[i] == e then objList[i] = objList[#objList]; objList[#objList] = nil; break end
+    end
+end
+
+-- =========================================================
+-- SCAN NPC
+-- =========================================================
+local lastNpcScan = 0
+local function scanNPCs()
+    for model, e in pairs(npcMap) do
+        if not model.Parent then removeNPC(model) end
+    end
+    local ok, descendants = pcall(function() return Workspace:GetDescendants() end)
+    if not ok or not descendants then return end
+    for _, inst in ipairs(descendants) do
+        if inst:IsA("Model") and isValidNPC(inst) then addNPC(inst) end
+    end
+end
+
+-- =========================================================
+-- HOOKS
+-- =========================================================
+local propsArmed = false
+
+local function onDescendantAdded(inst)
+    if not propsArmed or SHUTDOWN or not ENABLED then return end
+    if inst:IsA("Humanoid") then
+        local model = inst.Parent
+        if model and model:IsA("Model") and isValidNPC(model) then addNPC(model) end
+        return
+    end
+    if isValidPlayerObject(inst) then addObject(inst) end
+end
+
+local function onDescendantRemoving(inst)
+    if objMap[inst] then removeObject(inst) end
+end
+
+local hookedFolders = {}
+local function hookFolder(folder)
+    if hookedFolders[folder] then return end
+    hookedFolders[folder] = true
+    track(folder.DescendantAdded:Connect(onDescendantAdded))
+    track(folder.DescendantRemoving:Connect(onDescendantRemoving))
+    for _, inst in ipairs(folder:GetChildren()) do
+        if isValidPlayerObject(inst) then addObject(inst) end
+    end
+end
+
+local function hookAllPlayerFolders()
+    for _, name in ipairs(PLAYER_FOLDERS) do
+        local folder = Workspace:FindFirstChild(name)
+        if folder then hookFolder(folder) end
+    end
+end
+
+-- =========================================================
+-- RESOLVE
+-- =========================================================
+local function resolveChar(plr, o)
+    local char = plr.Character
+    if char and o.head and o.head.Parent == char then return true end
+    o.char = char
+    if not char then o.head=nil; o.hrp=nil; o.hum=nil; return false end
+    o.head = char:FindFirstChild("Head")
+    o.hrp  = char:FindFirstChild("HumanoidRootPart")
+    o.hum  = char:FindFirstChildOfClass("Humanoid")
+    return o.head ~= nil and o.hrp ~= nil and o.hum ~= nil
+end
+
+local function hideAll(o)
+    if not o.visible then return end
+    o.bg.Visible = false; o.l1.Visible = false
+    o.l2.Visible = false; o.l3.Visible = false
+    o.visible = false
+end
+
+-- =========================================================
+-- RENDER PLAYER
+-- =========================================================
+local function renderPlayer(plr, vp, camPos, now)
+    local o = getObjs(plr)
+    if not o then return end
+    if not resolveChar(plr, o) then hideAll(o); return end
+    if o.hum.Health <= 0 then hideAll(o); return end
+    o.isNPC=false; o.isObject=false; o.plr=plr
+
+    local delta = o.hrp.Position - camPos
+    local distSq = delta.X*delta.X + delta.Y*delta.Y + delta.Z*delta.Z
+    if distSq > MAX_DIST_SQ then hideAll(o); return end
+
+    local p3 = Cam:WorldToViewportPoint(o.head.Position + V3(0, 3, 0))
+    if p3.Z <= 0 then hideAll(o); return end
+    if p3.X < -MARGIN or p3.X > vp.X + MARGIN or p3.Y < -MARGIN or p3.Y > vp.Y + MARGIN then
+        hideAll(o); return
+    end
+
+    if now >= o.tText then
+        o.tText = now + T_TEXT
+        if o.lastTeam ~= plr.Team or o.teamCol == nil then
+            o.lastTeam = plr.Team
+            o.teamName, o.teamCol = resolveTeam(plr)
+        end
+        local tool = o.char and o.char:FindFirstChildOfClass("Tool")
+        o.lastTool = tool and tool.Name or nil
+        local teamCol = o.teamCol or DEFAULT_COL
+        local teamName = o.teamName
+        o.l1.Text = teamName and ("[" .. teamName .. "] " .. plr.Name) or plr.Name
+        o.l1.Color = teamCol
+        if o.lastTool then o.l2.Text = o.lastTool; o.l2.Color = TOOL_COL end
+        local pct = o.hum.Health / o.hum.MaxHealth
+        o.l3.Color = pct > 0.5 and HP_HIGH or pct > 0.25 and HP_MED or HP_LOW
+        o.l3.Text = (o.hum.Health // 1) .. " HP  ·  " .. distStr(sqrt(distSq))
+        local w1 = textWidth(o.l1, #o.l1.Text * 8)
+        local w3 = textWidth(o.l3, #o.l3.Text * 8)
+        local bw = max(w1, w3)
+        if o.lastTool then bw = max(bw, textWidth(o.l2, #o.lastTool * 8)) end
+        o.bw = bw + 10
+        o.blockH = PAD * 2 + (2 + (o.lastTool and 1 or 0)) * LINE_H
+    end
+
+    local x = p3.X; local y = p3.Y - o.blockH - 6
+    o.l1.Position = V2(x, y + PAD); o.l1.Visible = true
+    local ny = y + PAD + LINE_H
+    if o.lastTool then o.l2.Position = V2(x, ny); o.l2.Visible = true; ny = ny + LINE_H
+    else o.l2.Visible = false end
+    o.l3.Position = V2(x, ny); o.l3.Visible = true
+    o.bg.Size = V2(o.bw, o.blockH); o.bg.Position = V2(x - o.bw / 2, y); o.bg.Visible = true
+    o.visible = true
+end
+
+-- =========================================================
+-- RENDER NPC/OBJ (validation stricte avant tout accès)
+-- =========================================================
+local function renderEntity(e, vp, camPos, now)
+    local head, hrp = e.head, e.hrp
+    if not head or not head.Parent or not hrp or not hrp.Parent then
+        local o = cache[e.model]
+        if o then hideAll(o) end
+        return false
+    end
+
+    local o = getObjs(e.model)
+    if not o then return true end
+    if not e.model.Parent then hideAll(o); return false end
+
+    local delta = hrp.Position - camPos
+    local distSq = delta.X*delta.X + delta.Y*delta.Y + delta.Z*delta.Z
+    if distSq > MAX_DIST_SQ then hideAll(o); return true end
+
+    if not e.isObject then
+        if not e.hum or not e.hum.Parent then hideAll(o); return false end
+        if e.hum.Health <= 0 then hideAll(o); return true end
+    end
+
+    local p3 = Cam:WorldToViewportPoint(head.Position + V3(0, 3, 0))
+    if p3.Z <= 0 then hideAll(o); return true end
+    if p3.X < -MARGIN or p3.X > vp.X + MARGIN or p3.Y < -MARGIN or p3.Y > vp.Y + MARGIN then
+        hideAll(o); return true
+    end
+
+    o.isNPC = e.isNPC; o.isObject = e.isObject
+    o.head = head; o.hrp = hrp; o.hum = e.hum
+    o.plr = nil
+
+    if now >= o.tText then
+        o.tText = now + T_TEXT
+        local teamCol, displayName
+        if e.isObject then
+            teamCol = OBJECT_COL; displayName = "[OBJ] " .. e.model.Name
+        else
+            teamCol = NPC_COL; displayName = "[NPC] " .. e.model.Name
+        end
+        local tool = e.model:FindFirstChildOfClass("Tool")
+        o.lastTool = tool and tool.Name or nil
+        o.l1.Text = displayName; o.l1.Color = teamCol
+        if o.lastTool then o.l2.Text = o.lastTool; o.l2.Color = TOOL_COL end
+        local dist = sqrt(distSq)
+        if e.isObject then
+            o.l3.Text = distStr(dist); o.l3.Color = OBJECT_COL
+        else
+            local pct = e.hum.Health / e.hum.MaxHealth
+            o.l3.Color = pct > 0.5 and HP_HIGH or pct > 0.25 and HP_MED or HP_LOW
+            o.l3.Text = (e.hum.Health // 1) .. " HP  ·  " .. distStr(dist)
+        end
+        local w1 = textWidth(o.l1, #o.l1.Text * 8)
+        local w3 = textWidth(o.l3, #o.l3.Text * 8)
+        local bw = max(w1, w3)
+        if o.lastTool then bw = max(bw, textWidth(o.l2, #o.lastTool * 8)) end
+        o.bw = bw + 10
+        o.blockH = PAD * 2 + (2 + (o.lastTool and 1 or 0)) * LINE_H
+    end
+
+    local x = p3.X; local y = p3.Y - o.blockH - 6
+    o.l1.Position = V2(x, y + PAD); o.l1.Visible = true
+    local ny = y + PAD + LINE_H
+    if o.lastTool then o.l2.Position = V2(x, ny); o.l2.Visible = true; ny = ny + LINE_H
+    else o.l2.Visible = false end
+    o.l3.Position = V2(x, ny); o.l3.Visible = true
+    o.bg.Size = V2(o.bw, o.blockH); o.bg.Position = V2(x - o.bw / 2, y); o.bg.Visible = true
+    o.visible = true
+    return true
+end
+
+-- =========================================================
+-- SHUTDOWN
+-- =========================================================
+local function shutdown()
+    SHUTDOWN = true; ENABLED = false
+    for _, o in pairs(cache) do removeObj(o) end
+    cache = {}
+    for _, o in ipairs(freePool) do removeObj(o) end
+    freePool = {}
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+    Connections = {}
+    print("[ESP] Shutdown.")
+end
+
+-- =========================================================
+-- SORT
+-- =========================================================
+local lastNpcSort = 0
+local lastObjSort = 0
+
+local function sortByDist(list, camPos)
+    table.sort(list, function(a, b)
+        local ha, hb = a.hrp, b.hrp
+        if not ha or not ha.Parent then return false end
+        if not hb or not hb.Parent then return true end
+        local da, db = ha.Position - camPos, hb.Position - camPos
+        return da.X*da.X + da.Y*da.Y + da.Z*da.Z < db.X*db.X + db.Y*db.Y + db.Z*db.Z
+    end)
+end
+
+-- =========================================================
+-- LOOP
+-- =========================================================
+local deadFrameCounter = 0
+local RENDER_ERR_LOGGED = false
+local myHumCached = nil
+
+-- Cache le Humanoid local et gère sa mort par événement
+local function onLocalCharacterAdded(char)
+    myHumCached = char:WaitForChild("Humanoid", 5)
+end
+LP.CharacterAdded:Connect(onLocalCharacterAdded)
+if LP.Character then onLocalCharacterAdded(LP.Character) end
+
+track(RunService.Heartbeat:Connect(function()
+    if SHUTDOWN or not ENABLED then
+        if not SHUTDOWN then for _, o in pairs(cache) do hideAll(o) end end
+        return
+    end
+    if not Cam then Cam = Workspace.CurrentCamera; if not Cam then return end end
+
+    local now = clock()
+
+    if now - lastNpcScan >= NPC_SCAN_INTERVAL then
+        lastNpcScan = now
+        pcall(scanNPCs)
+    end
+
+    local camPos = Cam.CFrame.Position
+    local vp     = Cam.ViewportSize
+
+    -- Détection de mort via le Humanoid mis en cache (pas de FindFirstChild)
+    local isDead = false
+    if myHumCached and myHumCached.Parent then
+        if myHumCached.Health <= 0 then isDead = true end
+    else
+        isDead = true -- Character manquant = considéré mort
+    end
+
+    profileBegin("ESP_Render")
+
+    -- Joueurs : toujours rendus
+    for i = 1, #playerList do
+        local plr = playerList[i]
+        if plr and plr.Parent then renderPlayer(plr, vp, camPos, now) end
+    end
+
+    -- NPCs/Objets : skip frames si mort et beaucoup d'entités
+    if isDead and (#npcList + #objList) > 20 then
+        deadFrameCounter = deadFrameCounter + 1
+        if deadFrameCounter % DEAD_FRAME_SKIP ~= 0 then
+            profileEnd()
+            return
+        end
+    end
+
+    -- Tri
+    if now - lastNpcSort >= NPC_SORT_INTERVAL then
+        lastNpcSort = now
+        sortByDist(npcList, camPos)
+    end
+    if now - lastObjSort >= NPC_SORT_INTERVAL then
+        lastObjSort = now
+        sortByDist(objList, camPos)
+    end
+
+    -- Rendu NPCs (limité)
+    local npcLimit = #npcList < MAX_NPC_RENDER and #npcList or MAX_NPC_RENDER
+    for i = 1, npcLimit do
+        local e = npcList[i]
+        if e and e.model and e.model.Parent then
+            local ok = pcall(renderEntity, e, vp, camPos, now)
+            if not ok then removeNPC(e.model) end
+        end
+    end
+    for i = npcLimit + 1, #npcList do
+        local e = npcList[i]
+        if e and e.model then
+            local o = cache[e.model]
+            if o then hideAll(o) end
+        end
+    end
+
+    -- Rendu Objets (limité)
+    local objLimit = #objList < MAX_OBJ_RENDER and #objList or MAX_OBJ_RENDER
+    for i = 1, objLimit do
+        local e = objList[i]
+        if e and e.model and e.model.Parent then
+            local ok = pcall(renderEntity, e, vp, camPos, now)
+            if not ok then removeObject(e.model) end
+        end
+    end
+    for i = objLimit + 1, #objList do
+        local e = objList[i]
+        if e and e.model then
+            local o = cache[e.model]
+            if o then hideAll(o) end
+        end
+    end
+
+    profileEnd()
+end))
+
+-- =========================================================
+-- LIFECYCLE
+-- =========================================================
+local playerConnections = {}
+
+local function setupPlayerLifecycle(plr)
+    if plr == LP then return end
+    if playerConnections[plr] then
+        for _, c in ipairs(playerConnections[plr]) do c:Disconnect() end
+    end
+    playerConnections[plr] = {}
+
+    local charAddedConn = plr.CharacterAdded:Connect(function()
+        rebuildPlayerList()
+    end)
+    table.insert(playerConnections[plr], charAddedConn)
+
+    local charRemovingConn = plr.CharacterRemoving:Connect(function()
+        local o = cache[plr]
+        if o then hideAll(o) end
+    end)
+    table.insert(playerConnections[plr], charRemovingConn)
+end
+
+track(Players.PlayerAdded:Connect(function(plr)
+    rebuildPlayerList()
+    setupPlayerLifecycle(plr)
+end))
+
+track(Players.PlayerRemoving:Connect(function(plr)
+    rebuildPlayerList()
+    if playerConnections[plr] then
+        for _, c in ipairs(playerConnections[plr]) do c:Disconnect() end
+        playerConnections[plr] = nil
+    end
+    local o = cache[plr]
+    if o then hideAll(o); cache[plr] = nil; freePool[#freePool+1] = o end
+end))
+
+for _, plr in ipairs(Players:GetPlayers()) do
+    if plr ~= LP then setupPlayerLifecycle(plr) end
+end
+
+rebuildPlayerList()
+
+-- Camera rebind
+track(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    if Workspace.CurrentCamera then Cam = Workspace.CurrentCamera end
+end))
+
+-- Arm props + NPC hooks
+task.delay(ARM_DELAY, function()
+    if SHUTDOWN then return end
+    propsArmed = true
+    hookAllPlayerFolders()
+    track(Workspace.DescendantAdded:Connect(onDescendantAdded))
+    track(Workspace.DescendantRemoving:Connect(onDescendantRemoving))
+    track(Workspace.ChildAdded:Connect(function(inst)
+        for _, name in ipairs(PLAYER_FOLDERS) do
+            if inst.Name == name then hookFolder(inst); break end
+        end
+    end))
+end)
+
+-- Input
+track(UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if SHUTDOWN then return end
+    if input.KeyCode == TOGGLE_KEY then
+        ENABLED = not ENABLED
+        if not ENABLED then for _, o in pairs(cache) do hideAll(o) end end
+        print("[ESP] " .. (ENABLED and "ON" or "OFF"))
+    elseif input.KeyCode == CLOSE_KEY then
+        shutdown()
+    end
+end))
+
+pcall(scanNPCs)
+print("[ESP] Loaded. RightShift = toggle, End = shutdown.")
+print("[ESP] Players:", #playerList, "| NPCs:", #npcList, "| Objects:", #objList)
