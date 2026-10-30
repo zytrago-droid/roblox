@@ -1,2022 +1,614 @@
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local ContextActionService = game:GetService("ContextActionService")
-local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
+-- azerty098890
+-- FlyGuiV8 — Xeno-compatible
+-- Toggle fly: P or the Fly button. Move: W/A/S/D (camera-relative), Q/E down/up.
+-- Speed: ^ = +10, $ = -10. CF button switches body-mover <-> cframe mode. Ctrl+wheel resizes the GUI.
 
-if not RunService:IsClient() then
-	return
-end
+if _G.FlyGuiV8Loaded then return end
+_G.FlyGuiV8Loaded = true
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
+if not player.Character then player.CharacterAdded:Wait() end
+local character = player.Character
+local humanoid  = character:WaitForChild("Humanoid")
+local rootPart  = character:WaitForChild("HumanoidRootPart")
 
-if not player then
-	return
-end
-
--- azerty098890 est volontairement limité au clavier + souris.
-if not UserInputService.KeyboardEnabled
-	or not UserInputService.MouseEnabled then
-	return
-end
-
-local playerGui = player:WaitForChild("PlayerGui")
-
-local GUI_NAME = "azerty098890"
-
-local ACTION_FORWARD = "azerty098890_Forward"
-local ACTION_BACKWARD = "azerty098890_Backward"
-local ACTION_LEFT = "azerty098890_Left"
-local ACTION_RIGHT = "azerty098890_Right"
-local ACTION_UP = "azerty098890_Up"
-local ACTION_DOWN = "azerty098890_Down"
-
+--// Config
 local CONFIG = {
-	MinSpeed = 1,
-	MaxSpeed = 500,
-	DefaultSpeed = 80,
-
-	Acceleration = 12,
-	Deceleration = 18,
-
-	OrientationResponsiveness = 35,
-	MaxAngularVelocity = 100,
-	MaxTorque = 10000000,
-
-	DefaultTransparency = 0.75,
-
-	GUIWidth = 280,
-	GUIHeight = 250,
-
-	MaxDeltaTime = 0.1,
-
-	CharacterLoadTimeout = 10,
-	CharacterRetryDelay = 0.5,
-	CharacterRetryCount = 3,
-
-	GUI_MARGIN = 8,
-
-	InputPriority = 3000,
+    TOGGLE_KEY        = Enum.KeyCode.P,
+    MIN_SPEED         = 1,
+    MAX_SPEED         = 500,
+    DEFAULT_SPEED     = 50,
+    SPEED_STEP        = 10,
+    DEFAULT_TRANSP    = 0.75,
+    USE_CFRAME        = true,
+    PITCH_LOCK        = false,  -- cframe mode only. false = follow camera rotation, true = upright yaw only.
+    BODY_FACE_CAMERA  = false,  -- body-mover mode only. false = body keeps its orientation, camera stays free.
+                                --                                true = body rotates with camera (old behavior).
+    UI_SCALE_MIN      = 0.5,
+    UI_SCALE_MAX      = 2.0,
+    UI_SCALE_STEP     = 0.1,
 }
 
-CONFIG.MinSpeed = math.max(
-	0,
-	tonumber(CONFIG.MinSpeed) or 0
-)
+local SPEED_UP_KEY   = Enum.KeyCode.Six
+local SPEED_DOWN_KEY = Enum.KeyCode.Four
 
-CONFIG.MaxSpeed = math.max(
-	CONFIG.MinSpeed,
-	tonumber(CONFIG.MaxSpeed) or CONFIG.MinSpeed
-)
+local flySpeed        = CONFIG.DEFAULT_SPEED
+local flyTransparency = CONFIG.DEFAULT_TRANSP
+local useCFrameFly    = CONFIG.USE_CFRAME
+local FLYING          = false
+local isFlyToggledOn  = false
+local flyGen          = 0
+local flyConn, noclipConn, bodyLoopConn
+local currentGyro, currentVel
+local headWasAnchored = false
 
-CONFIG.DefaultSpeed = math.clamp(
-	tonumber(CONFIG.DefaultSpeed) or CONFIG.MinSpeed,
-	CONFIG.MinSpeed,
-	CONFIG.MaxSpeed
-)
+local CONTROL = {F = 0, B = 0, L = 0, R = 0, Q = 0, E = 0}
 
-CONFIG.Acceleration = math.max(
-	tonumber(CONFIG.Acceleration) or 0.01,
-	0.01
-)
-
-CONFIG.Deceleration = math.max(
-	tonumber(CONFIG.Deceleration) or 0.01,
-	0.01
-)
-
--- AlignOrientation documente Responsiveness entre 5 et 200.
-CONFIG.OrientationResponsiveness = math.clamp(
-	tonumber(CONFIG.OrientationResponsiveness) or 35,
-	5,
-	200
-)
-
-CONFIG.MaxAngularVelocity = math.max(
-	tonumber(CONFIG.MaxAngularVelocity) or 1,
-	0.01
-)
-
-CONFIG.MaxTorque = math.max(
-	tonumber(CONFIG.MaxTorque) or 1,
-	0.01
-)
-
-CONFIG.DefaultTransparency = math.clamp(
-	tonumber(CONFIG.DefaultTransparency) or 0,
-	0,
-	1
-)
-
-CONFIG.MaxDeltaTime = math.clamp(
-	tonumber(CONFIG.MaxDeltaTime) or 0.1,
-	0.016,
-	0.25
-)
-
-if playerGui:FindFirstChild(GUI_NAME) then
-	return
+local function resetControls()
+    CONTROL.F, CONTROL.B, CONTROL.L, CONTROL.R, CONTROL.Q, CONTROL.E = 0, 0, 0, 0, 0, 0
 end
 
-local state = {
-	Requested = false,
-	Active = false,
-	Destroying = false,
-
-	Speed = CONFIG.DefaultSpeed,
-	Transparency = CONFIG.DefaultTransparency,
-
-	Velocity = Vector3.zero,
-
-	Character = nil,
-	Humanoid = nil,
-	RootPart = nil,
-
-	PreviousAutoRotate = true,
-
-	Attachment = nil,
-	LinearVelocity = nil,
-	AlignOrientation = nil,
-
-	SavedParts = {},
-	Connections = {},
-
-	CharacterToken = 0,
-	UIToken = 0,
-
-	LastFacing = Vector3.new(0, 0, -1),
-
-	InputBound = false,
-}
-
-local input = {
-	Forward = 0,
-	Backward = 0,
-	Left = 0,
-	Right = 0,
-	Up = 0,
-	Down = 0,
-}
-
-local function disconnect(name)
-	local connection = state.Connections[name]
-
-	if connection then
-		connection:Disconnect()
-		state.Connections[name] = nil
-	end
-end
-
-local function connect(name, signal, callback)
-	disconnect(name)
-
-	if not signal then
-		return nil
-	end
-
-	local connection = signal:Connect(callback)
-
-	state.Connections[name] = connection
-
-	return connection
-end
-
-local function disconnectAll()
-	for name, connection in pairs(state.Connections) do
-		if connection then
-			connection:Disconnect()
-		end
-
-		state.Connections[name] = nil
-	end
-end
-
-local function resetInput()
-	for key in pairs(input) do
-		input[key] = 0
-	end
-
-	state.Velocity = Vector3.zero
-end
-
-local function isCharacterValid()
-	local character = state.Character
-	local humanoid = state.Humanoid
-	local rootPart = state.RootPart
-
-	return character ~= nil
-		and character.Parent ~= nil
-		and humanoid ~= nil
-		and humanoid.Parent ~= nil
-		and rootPart ~= nil
-		and rootPart.Parent ~= nil
-		and humanoid.Health > 0
-end
-
-local function loadCharacter(character, timeout)
-	if state.Destroying then
-		return false
-	end
-
-	if not character or not character.Parent then
-		return false
-	end
-
-	timeout = math.max(
-		0.1,
-		tonumber(timeout) or CONFIG.CharacterLoadTimeout
-	)
-
-	local deadline = os.clock() + timeout
-
-	local humanoid =
-		character:FindFirstChildOfClass("Humanoid")
-
-	if not humanoid then
-		local remaining =
-			math.max(0, deadline - os.clock())
-
-		if remaining > 0 then
-			humanoid = character:WaitForChild(
-				"Humanoid",
-				remaining
-			)
-		end
-	end
-
-	if not humanoid then
-		return false
-	end
-
-	local rootPart =
-		character:FindFirstChild("HumanoidRootPart")
-
-	if not rootPart then
-		local remaining =
-			math.max(0, deadline - os.clock())
-
-		if remaining > 0 then
-			rootPart = character:WaitForChild(
-				"HumanoidRootPart",
-				remaining
-			)
-		end
-	end
-
-	if not humanoid
-		or not rootPart
-		or not humanoid:IsA("Humanoid")
-		or not rootPart:IsA("BasePart") then
-		return false
-	end
-
-	if not character.Parent then
-		return false
-	end
-
-	state.Character = character
-	state.Humanoid = humanoid
-	state.RootPart = rootPart
-	state.PreviousAutoRotate = humanoid.AutoRotate
-
-	local look = rootPart.CFrame.LookVector
-
-	local horizontalLook = Vector3.new(
-		look.X,
-		0,
-		look.Z
-	)
-
-	if horizontalLook.Magnitude > 0.001 then
-		state.LastFacing = horizontalLook.Unit
-	end
-
-	return true
-end
-
+--// GUI
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = GUI_NAME
+screenGui.Name = "azerty098890"
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.Parent = playerGui
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+local uiScale = Instance.new("UIScale", screenGui)
+uiScale.Scale = 1
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.fromOffset(
-	CONFIG.GUIWidth,
-	CONFIG.GUIHeight
-)
-mainFrame.Position = UDim2.new(
-	0.5,
-	-CONFIG.GUIWidth / 2,
-	0.2,
-	0
-)
+mainFrame.Size = UDim2.new(0, 250, 0, 170)
+mainFrame.Position = UDim2.new(0.5, -125, 0.2, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(30, 32, 35)
 mainFrame.BorderSizePixel = 0
 mainFrame.ClipsDescendants = true
 mainFrame.Parent = screenGui
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+local uiStroke = Instance.new("UIStroke", mainFrame)
+uiStroke.Thickness = 2
+uiStroke.Color = Color3.fromRGB(0, 0, 0)
 
-local mainCorner = Instance.new("UICorner")
-mainCorner.CornerRadius = UDim.new(0, 10)
-mainCorner.Parent = mainFrame
+local headerFrame = Instance.new("Frame", mainFrame)
+headerFrame.Size = UDim2.new(1, 0, 0, 40)
+headerFrame.BackgroundTransparency = 1
 
-local mainStroke = Instance.new("UIStroke")
-mainStroke.Thickness = 1.5
-mainStroke.Color = Color3.fromRGB(15, 15, 15)
-mainStroke.Parent = mainFrame
+local titleLabel = Instance.new("TextLabel", headerFrame)
+titleLabel.Size = UDim2.new(1, -110, 1, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.Text = "azerty098890"
+titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleLabel.TextSize = 18
+titleLabel.TextXAlignment = Enum.TextXAlignment.Center
 
-local header = Instance.new("Frame")
-header.Name = "Header"
-header.Size = UDim2.new(1, 0, 0, 42)
-header.BackgroundTransparency = 1
-header.Parent = mainFrame
-
-local dragArea = Instance.new("Frame")
-dragArea.Name = "DragArea"
-dragArea.Size = UDim2.new(1, -80, 1, 0)
-dragArea.Position = UDim2.fromOffset(0, 0)
-dragArea.BackgroundTransparency = 1
-dragArea.Active = true
-dragArea.Parent = header
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -20, 1, 0)
-title.Position = UDim2.fromOffset(10, 0)
-title.BackgroundTransparency = 1
-title.Font = Enum.Font.GothamBold
-title.Text = "azerty098890"
-title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.TextSize = 17
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = dragArea
-
-local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.fromOffset(70, 18)
-statusLabel.Position = UDim2.new(1, -150, 0, 12)
-statusLabel.BackgroundTransparency = 1
-statusLabel.Font = Enum.Font.Gotham
-statusLabel.Text = "PC / AZERTY"
-statusLabel.TextColor3 = Color3.fromRGB(130, 130, 130)
-statusLabel.TextSize = 9
-statusLabel.TextXAlignment = Enum.TextXAlignment.Right
-statusLabel.Parent = header
-
-local minimizeButton = Instance.new("TextButton")
-minimizeButton.Name = "Minimize"
-minimizeButton.Size = UDim2.fromOffset(14, 14)
-minimizeButton.Position = UDim2.new(1, -48, 0.5, -7)
-minimizeButton.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
-minimizeButton.Text = ""
-minimizeButton.AutoButtonColor = false
-minimizeButton.Parent = header
-
-local minimizeCorner = Instance.new("UICorner")
-minimizeCorner.CornerRadius = UDim.new(1, 0)
-minimizeCorner.Parent = minimizeButton
-
-local closeButton = Instance.new("TextButton")
-closeButton.Name = "Close"
-closeButton.Size = UDim2.fromOffset(14, 14)
-closeButton.Position = UDim2.new(1, -24, 0.5, -7)
+local closeButton = Instance.new("TextButton", headerFrame)
+closeButton.Size = UDim2.new(0, 12, 0, 12)
+closeButton.Position = UDim2.new(1, -22, 0.5, -6)
 closeButton.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
 closeButton.Text = ""
-closeButton.AutoButtonColor = false
-closeButton.Parent = header
+Instance.new("UICorner", closeButton).CornerRadius = UDim.new(1, 0)
 
-local closeCorner = Instance.new("UICorner")
-closeCorner.CornerRadius = UDim.new(1, 0)
-closeCorner.Parent = closeButton
+local minimizeButton = Instance.new("TextButton", headerFrame)
+minimizeButton.Size = UDim2.new(0, 12, 0, 12)
+minimizeButton.Position = UDim2.new(1, -40, 0.5, -6)
+minimizeButton.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
+minimizeButton.Text = ""
+Instance.new("UICorner", minimizeButton).CornerRadius = UDim.new(1, 0)
 
-local body = Instance.new("Frame")
-body.Name = "Body"
-body.Size = UDim2.new(1, 0, 1, -42)
-body.Position = UDim2.fromOffset(0, 42)
-body.BackgroundTransparency = 1
-body.Parent = mainFrame
+local cframeToggle = Instance.new("TextButton", headerFrame)
+cframeToggle.Size = UDim2.new(0, 56, 0, 22)
+cframeToggle.Position = UDim2.new(1, -102, 0.5, -11)
+cframeToggle.BackgroundColor3 = Color3.fromRGB(44, 46, 51)
+cframeToggle.Font = Enum.Font.GothamBold
+cframeToggle.Text = "CF: OFF"
+cframeToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+cframeToggle.TextSize = 12
+Instance.new("UICorner", cframeToggle).CornerRadius = UDim.new(0, 4)
+local cframeStroke = Instance.new("UIStroke", cframeToggle)
+cframeStroke.Color = Color3.fromRGB(20, 20, 20)
 
-local flyButton = Instance.new("TextButton")
-flyButton.Name = "FlyButton"
-flyButton.Size = UDim2.new(1, -20, 0, 38)
-flyButton.Position = UDim2.fromOffset(10, 10)
+local function paintCFButton()
+    if useCFrameFly then
+        cframeToggle.Text = "CF: ON"
+        cframeToggle.TextColor3 = Color3.fromRGB(88, 101, 242)
+        cframeStroke.Color = Color3.fromRGB(88, 101, 242)
+        cframeToggle.BackgroundColor3 = Color3.fromRGB(60, 70, 110)
+    else
+        cframeToggle.Text = "CF: OFF"
+        cframeToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+        cframeStroke.Color = Color3.fromRGB(20, 20, 20)
+        cframeToggle.BackgroundColor3 = Color3.fromRGB(44, 46, 51)
+    end
+end
+paintCFButton()
+
+local bodyFrame = Instance.new("Frame", mainFrame)
+bodyFrame.Size = UDim2.new(1, 0, 1, -40)
+bodyFrame.Position = UDim2.new(0, 0, 0, 40)
+bodyFrame.BackgroundTransparency = 1
+
+local flyButton = Instance.new("TextButton", bodyFrame)
+flyButton.Size = UDim2.new(1, -20, 0, 35)
+flyButton.Position = UDim2.new(0, 10, 0, 10)
 flyButton.BackgroundColor3 = Color3.fromRGB(44, 46, 51)
-flyButton.Font = Enum.Font.GothamBold
-flyButton.Text = "FLY : OFF"
+flyButton.Font = Enum.Font.Gotham
+flyButton.Text = "Fly"
 flyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-flyButton.TextSize = 15
-flyButton.AutoButtonColor = false
-flyButton.Parent = body
-
-local flyCorner = Instance.new("UICorner")
-flyCorner.CornerRadius = UDim.new(0, 7)
-flyCorner.Parent = flyButton
-
-local flyStroke = Instance.new("UIStroke")
+flyButton.TextSize = 16
+Instance.new("UICorner", flyButton).CornerRadius = UDim.new(0, 6)
+local flyStroke = Instance.new("UIStroke", flyButton)
 flyStroke.Color = Color3.fromRGB(20, 20, 20)
-flyStroke.Thickness = 1
-flyStroke.Parent = flyButton
 
-local speedLabel = Instance.new("TextLabel")
-speedLabel.Size = UDim2.new(1, -20, 0, 20)
-speedLabel.Position = UDim2.fromOffset(10, 58)
-speedLabel.BackgroundTransparency = 1
-speedLabel.Font = Enum.Font.Gotham
-speedLabel.TextColor3 = Color3.fromRGB(205, 205, 205)
-speedLabel.TextSize = 13
-speedLabel.TextXAlignment = Enum.TextXAlignment.Left
-speedLabel.Parent = body
+local speedSliderLabel = Instance.new("TextLabel", bodyFrame)
+speedSliderLabel.Size = UDim2.new(1, -20, 0, 20)
+speedSliderLabel.Position = UDim2.new(0, 10, 0, 55)
+speedSliderLabel.BackgroundTransparency = 1
+speedSliderLabel.Font = Enum.Font.Gotham
+speedSliderLabel.Text = "Speed: " .. CONFIG.DEFAULT_SPEED
+speedSliderLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+speedSliderLabel.TextSize = 14
+speedSliderLabel.TextXAlignment = Enum.TextXAlignment.Left
 
-local speedSlider = Instance.new("Frame")
-speedSlider.Size = UDim2.new(1, -30, 0, 6)
-speedSlider.Position = UDim2.fromOffset(15, 83)
-speedSlider.BackgroundColor3 = Color3.fromRGB(18, 20, 23)
-speedSlider.BorderSizePixel = 0
-speedSlider.Active = true
-speedSlider.Parent = body
+local speedSlider = Instance.new("Frame", bodyFrame)
+speedSlider.Size = UDim2.new(1, -20, 0, 6)
+speedSlider.Position = UDim2.new(0, 10, 0, 80)
+speedSlider.BackgroundColor3 = Color3.fromRGB(20, 22, 25)
+Instance.new("UICorner", speedSlider).CornerRadius = UDim.new(0, 3)
 
-local speedSliderCorner = Instance.new("UICorner")
-speedSliderCorner.CornerRadius = UDim.new(1, 0)
-speedSliderCorner.Parent = speedSlider
+local sliderBar = Instance.new("Frame", speedSlider)
+sliderBar.Size = UDim2.new(0, 0, 1, 0)
+sliderBar.BackgroundColor3 = Color3.fromRGB(114, 137, 218)
+Instance.new("UICorner", sliderBar).CornerRadius = UDim.new(0, 3)
 
-local speedBar = Instance.new("Frame")
-speedBar.BackgroundColor3 = Color3.fromRGB(88, 101, 242)
-speedBar.BorderSizePixel = 0
-speedBar.Parent = speedSlider
+local sliderHandle = Instance.new("TextButton", speedSlider)
+sliderHandle.Size = UDim2.new(0, 18, 0, 18)
+sliderHandle.Position = UDim2.new(0, -9, 0.5, -9)
+sliderHandle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+sliderHandle.Text = ""
+Instance.new("UICorner", sliderHandle).CornerRadius = UDim.new(1, 0)
 
-local speedBarCorner = Instance.new("UICorner")
-speedBarCorner.CornerRadius = UDim.new(1, 0)
-speedBarCorner.Parent = speedBar
-
-local speedHandle = Instance.new("TextButton")
-speedHandle.Size = UDim2.fromOffset(18, 18)
-speedHandle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-speedHandle.Text = ""
-speedHandle.AutoButtonColor = false
-speedHandle.Parent = speedSlider
-
-local speedHandleCorner = Instance.new("UICorner")
-speedHandleCorner.CornerRadius = UDim.new(1, 0)
-speedHandleCorner.Parent = speedHandle
-
-local transparencyLabel = Instance.new("TextLabel")
-transparencyLabel.Size = UDim2.new(0.55, -15, 0, 30)
-transparencyLabel.Position = UDim2.fromOffset(10, 105)
+local transparencyLabel = Instance.new("TextLabel", bodyFrame)
+transparencyLabel.Size = UDim2.new(0.5, -15, 0, 30)
+transparencyLabel.Position = UDim2.new(0, 10, 0, 95)
 transparencyLabel.BackgroundTransparency = 1
 transparencyLabel.Font = Enum.Font.Gotham
-transparencyLabel.Text = "Transparency"
-transparencyLabel.TextColor3 = Color3.fromRGB(205, 205, 205)
-transparencyLabel.TextSize = 13
+transparencyLabel.Text = "Transparency:"
+transparencyLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+transparencyLabel.TextSize = 14
 transparencyLabel.TextXAlignment = Enum.TextXAlignment.Left
-transparencyLabel.Parent = body
 
-local transparencyBox = Instance.new("TextBox")
-transparencyBox.Size = UDim2.new(0.45, -15, 0, 30)
-transparencyBox.Position = UDim2.new(0.55, 5, 0, 105)
+local transparencyBox = Instance.new("TextBox", bodyFrame)
+transparencyBox.Size = UDim2.new(0.5, -15, 0, 30)
+transparencyBox.Position = UDim2.new(0.5, 5, 0, 95)
 transparencyBox.BackgroundColor3 = Color3.fromRGB(20, 22, 25)
 transparencyBox.Font = Enum.Font.Gotham
-transparencyBox.Text = tostring(state.Transparency)
+transparencyBox.Text = tostring(CONFIG.DEFAULT_TRANSP)
 transparencyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-transparencyBox.TextSize = 13
+transparencyBox.TextSize = 14
 transparencyBox.ClearTextOnFocus = false
-transparencyBox.Parent = body
+Instance.new("UICorner", transparencyBox).CornerRadius = UDim.new(0, 4)
 
-local transparencyCorner = Instance.new("UICorner")
-transparencyCorner.CornerRadius = UDim.new(0, 5)
-transparencyCorner.Parent = transparencyBox
+--// Drag
+local function makeDraggable(guiObject, dragHandle)
+    local dragging, dragStart, startPos
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = guiObject.Position
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            guiObject.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+makeDraggable(mainFrame, headerFrame)
 
-local infoLabel = Instance.new("TextLabel")
-infoLabel.Size = UDim2.new(1, -20, 0, 55)
-infoLabel.Position = UDim2.fromOffset(10, 148)
-infoLabel.BackgroundTransparency = 1
-infoLabel.Font = Enum.Font.Gotham
-infoLabel.Text =
-	"ZQSD  Move    E/A  Up/Down\n"
-	.. "Camera-relative flight\n"
-	.. "LinearVelocity + AlignOrientation"
-infoLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
-infoLabel.TextSize = 11
-infoLabel.TextXAlignment = Enum.TextXAlignment.Left
-infoLabel.TextYAlignment = Enum.TextYAlignment.Top
-infoLabel.Parent = body
-
-local function updateFlyButton()
-	if not flyButton.Parent then
-		return
-	end
-
-	if state.Active then
-		flyButton.Text = "FLY : ON"
-		flyButton.TextColor3 =
-			Color3.fromRGB(120, 130, 255)
-		flyStroke.Color =
-			Color3.fromRGB(88, 101, 242)
-	else
-		flyButton.Text = "FLY : OFF"
-		flyButton.TextColor3 =
-			Color3.fromRGB(255, 255, 255)
-		flyStroke.Color =
-			Color3.fromRGB(20, 20, 20)
-	end
+--// Speed slider
+local function paintSpeedSlider()
+    local range = CONFIG.MAX_SPEED - CONFIG.MIN_SPEED
+    local p = range > 0 and (flySpeed - CONFIG.MIN_SPEED) / range or 0
+    sliderBar.Size = UDim2.new(p, 0, 1, 0)
+    sliderHandle.Position = UDim2.new(p, -9, 0.5, -9)
+    speedSliderLabel.Text = string.format("Speed: %.0f", flySpeed)
 end
 
-local function savePart(part)
-	if not part
-		or not part.Parent
-		or not part:IsA("BasePart") then
-		return
-	end
-
-	if state.SavedParts[part] then
-		return
-	end
-
-	state.SavedParts[part] = {
-		CanCollide = part.CanCollide,
-		LocalTransparencyModifier =
-			part.LocalTransparencyModifier,
-	}
+local function setSpeed(v)
+    flySpeed = math.clamp(v, CONFIG.MIN_SPEED, CONFIG.MAX_SPEED)
+    paintSpeedSlider()
 end
 
-local function saveCharacterProperties()
-	table.clear(state.SavedParts)
-
-	local character = state.Character
-
-	if not character
-		or not character.Parent then
-		return
-	end
-
-	for _, object in ipairs(character:GetDescendants()) do
-		savePart(object)
-	end
+local function updateSlider(input)
+    local width = speedSlider.AbsoluteSize.X
+    if width <= 0 then return end
+    local x = math.clamp(input.Position.X - speedSlider.AbsolutePosition.X, 0, width)
+    local p = x / width
+    setSpeed(CONFIG.MIN_SPEED + p * (CONFIG.MAX_SPEED - CONFIG.MIN_SPEED))
 end
 
-local function restoreCharacterProperties()
-	for part, properties in pairs(state.SavedParts) do
-		if part and part.Parent then
-			part.CanCollide =
-				properties.CanCollide
+paintSpeedSlider()
 
-			part.LocalTransparencyModifier =
-				properties.LocalTransparencyModifier
-		end
-	end
-
-	table.clear(state.SavedParts)
+--// Noclip
+local function NoclipLoop()
+    if not character then return end
+    for _, child in ipairs(character:GetDescendants()) do
+        if child:IsA("BasePart") and child.CanCollide then
+            child.CanCollide = false
+        end
+    end
 end
 
-local function applyTransparency(part)
-	if not part
-		or not part.Parent
-		or not part:IsA("BasePart") then
-		return
-	end
-
-	if part == state.RootPart then
-		part.LocalTransparencyModifier = 0
-	else
-		part.LocalTransparencyModifier =
-			state.Transparency
-	end
+--// Move vector
+local function getMoveVector()
+    local cam = workspace.CurrentCamera
+    if not cam then return Vector3.new(0, 0, 0) end
+    local cf = cam.CFrame
+    local move = cf.LookVector * (CONTROL.F + CONTROL.B)
+        + cf.RightVector * (CONTROL.L + CONTROL.R)
+        + Vector3.new(0, CONTROL.Q + CONTROL.E, 0)
+    if move.Magnitude > 1 then move = move.Unit end
+    return move
 end
 
-local function applyTransparencyToSavedParts()
-	if not state.Active then
-		return
-	end
-
-	for part in pairs(state.SavedParts) do
-		if part and part.Parent then
-			applyTransparency(part)
-		end
-	end
+--// Destroy leftover body movers
+local function destroyBodyMovers()
+    if currentGyro then
+        pcall(function() currentGyro:Destroy() end)
+        currentGyro = nil
+    end
+    if currentVel then
+        pcall(function() currentVel:Destroy() end)
+        currentVel = nil
+    end
 end
 
-local function disableCollision(part)
-	if not part
-		or not part.Parent
-		or not part:IsA("BasePart") then
-		return
-	end
+--// CFrame mover
+local function startCFrameFlyLoop()
+    local char = character
+    local head = char and char:FindFirstChild("Head")
+    if FLYING or not head then return end
+    FLYING = true
+    flyGen += 1
+    local gen = flyGen
 
-	savePart(part)
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then part.CanCollide = false end
+    end
+    if humanoid then humanoid.PlatformStand = true end
+    headWasAnchored = head.Anchored
+    head.Anchored = true
 
-	part.CanCollide = false
-
-	if state.Active then
-		applyTransparency(part)
-	end
+    flyConn = RunService.Heartbeat:Connect(function(dt)
+        if gen ~= flyGen or not FLYING then
+            if flyConn then flyConn:Disconnect(); flyConn = nil end
+            return
+        end
+        local h = char and char:FindFirstChild("Head")
+        local cam = workspace.CurrentCamera
+        if not h or not h.Parent or not cam then
+            if flyConn then flyConn:Disconnect(); flyConn = nil end
+            return
+        end
+        local pos = h.Position + getMoveVector() * flySpeed * dt
+        if CONFIG.PITCH_LOCK then
+            local look = cam.CFrame.LookVector
+            local flat = Vector3.new(look.X, 0, look.Z)
+            if flat.Magnitude > 0.05 then
+                h.CFrame = CFrame.lookAt(pos, pos + flat.Unit)
+            else
+                h.CFrame = CFrame.new(pos)
+            end
+        else
+            h.CFrame = CFrame.new(pos) * cam.CFrame.Rotation
+        end
+    end)
 end
 
-local function setupNoclip()
-	disconnect("NoclipDescendant")
+--// BodyMover mover
+local function startBodyMoverFlyLoop()
+    local rp, hum = rootPart, humanoid
+    if FLYING or not rp or not hum then return end
+    FLYING = true
+    flyGen += 1
+    local gen = flyGen
 
-	local character = state.Character
+    destroyBodyMovers()
+    noclipConn = RunService.Heartbeat:Connect(NoclipLoop)
 
-	if not character
-		or not character.Parent then
-		return
-	end
+    -- FIX: capture the body's orientation at fly start. In BODY_FACE_CAMERA=false mode
+    -- we hold this rotation for the whole flight so the camera never gets dragged.
+    local lockedRot = (rp.CFrame - rp.CFrame.Position).Rotation
 
-	for _, object in ipairs(character:GetDescendants()) do
-		disableCollision(object)
-	end
+    local gyro = Instance.new("BodyGyro")
+    gyro.P = 9e4
+    gyro.D = 500
+    gyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    gyro.CFrame = rp.CFrame
+    gyro.Parent = rp
+    currentGyro = gyro
 
-	connect(
-		"NoclipDescendant",
-		character.DescendantAdded,
-		function(object)
-			if not state.Active then
-				return
-			end
+    local vel = Instance.new("BodyVelocity")
+    vel.Velocity = Vector3.new(0, 0, 0)
+    vel.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    vel.Parent = rp
+    currentVel = vel
 
-			disableCollision(object)
-		end
-	)
+    hum.PlatformStand = true
+
+    bodyLoopConn = RunService.Heartbeat:Connect(function()
+        if gen ~= flyGen or not FLYING then
+            if bodyLoopConn then bodyLoopConn:Disconnect(); bodyLoopConn = nil end
+            destroyBodyMovers()
+            if hum and hum.Parent then
+                hum.PlatformStand = false
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+            end
+            resetControls()
+            return
+        end
+        local cam = workspace.CurrentCamera
+        if not rp.Parent then return end
+        vel.Velocity = getMoveVector() * flySpeed
+
+        if CONFIG.BODY_FACE_CAMERA and cam then
+            -- old behavior: body rotates with the camera (can drag camera in follow/shiftlock games)
+            if CONFIG.PITCH_LOCK then
+                local look = cam.CFrame.LookVector
+                local flat = Vector3.new(look.X, 0, look.Z)
+                if flat.Magnitude > 0.05 then
+                    gyro.CFrame = CFrame.lookAt(rp.Position, rp.Position + flat.Unit)
+                end
+            else
+                gyro.CFrame = cam.CFrame
+            end
+        else
+            -- new default: body keeps its orientation, camera stays free
+            gyro.CFrame = CFrame.new(rp.Position) * lockedRot
+        end
+    end)
 end
 
-local function destroyFlightObjects()
-	local linearVelocity = state.LinearVelocity
-	local alignOrientation = state.AlignOrientation
-	local attachment = state.Attachment
+--// Weak-keys state table
+local savedState = setmetatable({}, {__mode = "k"})
 
-	state.LinearVelocity = nil
-	state.AlignOrientation = nil
-	state.Attachment = nil
-
-	if linearVelocity then
-		linearVelocity:Destroy()
-	end
-
-	if alignOrientation then
-		alignOrientation:Destroy()
-	end
-
-	if attachment then
-		attachment:Destroy()
-	end
+local function captureAndApplyFlyVisual(state)
+    if not character then return end
+    if state then
+        savedState = setmetatable({}, {__mode = "k"})
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                savedState[part] = {
+                    transparency = part.Transparency,
+                    canCollide   = part.CanCollide,
+                }
+                if part.Name ~= "HumanoidRootPart" then
+                    part.Transparency = flyTransparency
+                end
+                part.CanCollide = false
+            end
+        end
+    else
+        for part, s in pairs(savedState) do
+            if part and part.Parent then
+                part.Transparency = s.transparency
+                part.CanCollide   = s.canCollide
+            end
+        end
+        savedState = setmetatable({}, {__mode = "k"})
+    end
 end
 
-local function createFlightObjects()
-	local rootPart = state.RootPart
-
-	if not rootPart
-		or not rootPart.Parent
-		or not rootPart:IsA("BasePart") then
-		return false
-	end
-
-	destroyFlightObjects()
-
-	local attachment
-	local linearVelocity
-	local alignOrientation
-
-	local success = pcall(function()
-		attachment = Instance.new("Attachment")
-		attachment.Name =
-			GUI_NAME .. "_Attachment"
-		attachment.Parent = rootPart
-
-		linearVelocity = Instance.new("LinearVelocity")
-		linearVelocity.Name =
-			GUI_NAME .. "_LinearVelocity"
-
-		linearVelocity.Attachment0 =
-			attachment
-
-		linearVelocity.RelativeTo =
-			Enum.ActuatorRelativeTo.World
-
-		linearVelocity.VelocityConstraintMode =
-			Enum.VelocityConstraintMode.Vector
-
-		linearVelocity.ForceLimitsEnabled = false
-		linearVelocity.VectorVelocity =
-			Vector3.zero
-
-		linearVelocity.Parent = rootPart
-
-		alignOrientation = Instance.new("AlignOrientation")
-		alignOrientation.Name =
-			GUI_NAME .. "_AlignOrientation"
-
-		alignOrientation.Mode =
-			Enum.OrientationAlignmentMode.OneAttachment
-
-		alignOrientation.Attachment0 =
-			attachment
-
-		alignOrientation.RigidityEnabled = false
-
-		alignOrientation.MaxTorque =
-			CONFIG.MaxTorque
-
-		alignOrientation.MaxAngularVelocity =
-			CONFIG.MaxAngularVelocity
-
-		alignOrientation.Responsiveness =
-			CONFIG.OrientationResponsiveness
-
-		alignOrientation.CFrame =
-			rootPart.CFrame
-
-		alignOrientation.Parent = rootPart
-	end)
-
-	if not success then
-		if linearVelocity then
-			linearVelocity:Destroy()
-		end
-
-		if alignOrientation then
-			alignOrientation:Destroy()
-		end
-
-		if attachment then
-			attachment:Destroy()
-		end
-
-		return false
-	end
-
-	state.Attachment = attachment
-	state.LinearVelocity = linearVelocity
-	state.AlignOrientation = alignOrientation
-
-	return true
+local function applyTransparencyLive()
+    if not FLYING or not character then return end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+            part.Transparency = flyTransparency
+        end
+    end
 end
 
-local function getCameraBasis()
-	local camera = workspace.CurrentCamera
-
-	local horizontalLook
-
-	if camera then
-		local look = camera.CFrame.LookVector
-
-		horizontalLook = Vector3.new(
-			look.X,
-			0,
-			look.Z
-		)
-	end
-
-	if not horizontalLook
-		or horizontalLook.Magnitude <= 0.001 then
-
-		horizontalLook = state.LastFacing
-	end
-
-	if horizontalLook.Magnitude <= 0.001 then
-		horizontalLook =
-			Vector3.new(0, 0, -1)
-	end
-
-	horizontalLook = horizontalLook.Unit
-
-	state.LastFacing = horizontalLook
-
-	local horizontalRight =
-		horizontalLook:Cross(Vector3.yAxis)
-
-	if horizontalRight.Magnitude <= 0.001 then
-		horizontalRight =
-			Vector3.new(1, 0, 0)
-	else
-		horizontalRight =
-			horizontalRight.Unit
-	end
-
-	return horizontalLook, horizontalRight
+--// Stop
+local function stopFly()
+    if not FLYING then return end
+    FLYING = false
+    flyGen += 1
+    if flyConn then flyConn:Disconnect(); flyConn = nil end
+    if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
+    if bodyLoopConn then bodyLoopConn:Disconnect(); bodyLoopConn = nil end
+    destroyBodyMovers()
+    resetControls()
+    if character then
+        local head = character:FindFirstChild("Head")
+        if head then head.Anchored = headWasAnchored end
+    end
+    headWasAnchored = false
+    if humanoid and humanoid.Parent then
+        humanoid.PlatformStand = false
+        pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+    end
+    captureAndApplyFlyVisual(false)
 end
 
-local function getInputVector()
-	local x = input.Right - input.Left
-	local y = input.Up - input.Down
-	local z = input.Forward - input.Backward
-
-	local vector =
-		Vector3.new(x, y, z)
-
-	if vector.Magnitude > 1 then
-		vector = vector.Unit
-	end
-
-	return vector
+--// Toggle
+local function setFlying(state)
+    isFlyToggledOn = state
+    flyButton.TextColor3 = state and Color3.fromRGB(88, 101, 242) or Color3.fromRGB(255, 255, 255)
+    flyStroke.Color = state and Color3.fromRGB(88, 101, 242) or Color3.fromRGB(20, 20, 20)
+    if not character or not character.Parent then return end
+    if state then
+        if FLYING then return end
+        resetControls()
+        captureAndApplyFlyVisual(true)
+        if useCFrameFly then startCFrameFlyLoop() else startBodyMoverFlyLoop() end
+    else
+        stopFly()
+    end
 end
 
--- Forward declarations.
-local stopFlight
-local startFlight
+--// Keybinds
+local keyMap = {
+    [Enum.KeyCode.W] = "F", [Enum.KeyCode.S] = "B",
+    [Enum.KeyCode.A] = "L", [Enum.KeyCode.D] = "R",
+    [Enum.KeyCode.Q] = "Q", [Enum.KeyCode.E] = "E",
+}
+local valueMap = {
+    [Enum.KeyCode.W] =  1, [Enum.KeyCode.S] = -1,
+    [Enum.KeyCode.A] = -1, [Enum.KeyCode.D] =  1,
+    [Enum.KeyCode.Q] = -1, [Enum.KeyCode.E] =  1,
+}
 
-local function updateFlight(deltaTime)
-	if state.Destroying
-		or not state.Active then
-		return
-	end
-
-	if not isCharacterValid() then
-		stopFlight(false)
-		return
-	end
-
-	local rootPart = state.RootPart
-
-	if not rootPart
-		or not rootPart.Parent then
-		stopFlight(false)
-		return
-	end
-
-	local linearVelocity =
-		state.LinearVelocity
-
-	local alignOrientation =
-		state.AlignOrientation
-
-	if not linearVelocity
-		or not linearVelocity.Parent
-		or not alignOrientation
-		or not alignOrientation.Parent then
-
-		if not createFlightObjects() then
-			stopFlight(false)
-			return
-		end
-
-		linearVelocity =
-			state.LinearVelocity
-
-		alignOrientation =
-			state.AlignOrientation
-	end
-
-	if not linearVelocity
-		or not alignOrientation then
-		stopFlight(false)
-		return
-	end
-
-	local dt = math.clamp(
-		tonumber(deltaTime) or 0,
-		0,
-		CONFIG.MaxDeltaTime
-	)
-
-	if dt <= 0 then
-		return
-	end
-
-	local horizontalLook, horizontalRight =
-		getCameraBasis()
-
-	local movement =
-		getInputVector()
-
-	local desiredDirection =
-		horizontalRight * movement.X
-		+ Vector3.yAxis * movement.Y
-		+ horizontalLook * movement.Z
-
-	if desiredDirection.Magnitude > 1 then
-		desiredDirection =
-			desiredDirection.Unit
-	end
-
-	local targetVelocity =
-		desiredDirection * state.Speed
-
-	alignOrientation.CFrame =
-		CFrame.lookAt(
-			rootPart.Position,
-			rootPart.Position + horizontalLook,
-			Vector3.yAxis
-		)
-
-	local response
-
-	if targetVelocity.Magnitude > 0.001 then
-		response = CONFIG.Acceleration
-	else
-		response = CONFIG.Deceleration
-	end
-
-	local alpha =
-		1 - math.exp(-response * dt)
-
-	state.Velocity =
-		state.Velocity:Lerp(
-			targetVelocity,
-			alpha
-		)
-
-	if state.Velocity.Magnitude < 0.01 then
-		state.Velocity = Vector3.zero
-	end
-
-	linearVelocity.VectorVelocity =
-		state.Velocity
+local function speedDeltaFor(input)
+    local kc = input.KeyCode
+    if kc == SPEED_UP_KEY then return CONFIG.SPEED_STEP end
+    if kc == SPEED_DOWN_KEY then return -CONFIG.SPEED_STEP end
+    local ok, s = pcall(function() return UserInputService:GetStringForKeyCode(kc) end)
+    if ok and s then
+        if s == "^" then return CONFIG.SPEED_STEP end
+        if s == "$" then return -CONFIG.SPEED_STEP end
+    end
+    return nil
 end
 
-local function unbindFlightInput()
-	ContextActionService:UnbindAction(
-		ACTION_FORWARD
-	)
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe or UserInputService:GetFocusedTextBox() then return end
+    if input.KeyCode == CONFIG.TOGGLE_KEY then
+        setFlying(not isFlyToggledOn)
+        return
+    end
+    local d = speedDeltaFor(input)
+    if d then setSpeed(flySpeed + d); return end
+    local k = keyMap[input.KeyCode]
+    if k then CONTROL[k] = valueMap[input.KeyCode] end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    local k = keyMap[input.KeyCode]
+    if k then CONTROL[k] = 0 end
+end)
 
-	ContextActionService:UnbindAction(
-		ACTION_BACKWARD
-	)
+-- Ctrl+wheel resizes the GUI
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+    if not UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+        and not UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then return end
+    local nextScale = uiScale.Scale + input.Position.Z * CONFIG.UI_SCALE_STEP
+    uiScale.Scale = math.clamp(nextScale, CONFIG.UI_SCALE_MIN, CONFIG.UI_SCALE_MAX)
+end)
 
-	ContextActionService:UnbindAction(
-		ACTION_LEFT
-	)
-
-	ContextActionService:UnbindAction(
-		ACTION_RIGHT
-	)
-
-	ContextActionService:UnbindAction(
-		ACTION_UP
-	)
-
-	ContextActionService:UnbindAction(
-		ACTION_DOWN
-	)
-
-	state.InputBound = false
-
-	resetInput()
+--// Died + Respawn
+local function bindHumanoidSignals(h)
+    if not h then return end
+    h.Died:Connect(function()
+        if FLYING then stopFly() end
+    end)
 end
-
-local function movementHandler(name)
-	return function(_, inputState)
-		if state.Destroying
-			or not state.Active then
-
-			return Enum.ContextActionResult.Pass
-		end
-
-		if UserInputService:GetFocusedTextBox() then
-			resetInput()
-
-			if state.LinearVelocity
-				and state.LinearVelocity.Parent then
-
-				state.LinearVelocity.VectorVelocity =
-					Vector3.zero
-			end
-
-			return Enum.ContextActionResult.Pass
-		end
-
-		if inputState == Enum.UserInputState.Begin then
-			input[name] = 1
-
-		elseif inputState == Enum.UserInputState.End
-			or inputState == Enum.UserInputState.Cancel then
-
-			input[name] = 0
-		end
-
-		return Enum.ContextActionResult.Sink
-	end
-end
-
-local function bindFlightInput()
-	if state.InputBound
-		or state.Destroying
-		or not state.Active then
-		return
-	end
-
-	ContextActionService:BindActionAtPriority(
-		ACTION_FORWARD,
-		movementHandler("Forward"),
-		false,
-		CONFIG.InputPriority,
-		Enum.KeyCode.W
-	)
-
-	ContextActionService:BindActionAtPriority(
-		ACTION_BACKWARD,
-		movementHandler("Backward"),
-		false,
-		CONFIG.InputPriority,
-		Enum.KeyCode.S
-	)
-
-	ContextActionService:BindActionAtPriority(
-		ACTION_LEFT,
-		movementHandler("Left"),
-		false,
-		CONFIG.InputPriority,
-		Enum.KeyCode.A
-	)
-
-	ContextActionService:BindActionAtPriority(
-		ACTION_RIGHT,
-		movementHandler("Right"),
-		false,
-		CONFIG.InputPriority,
-		Enum.KeyCode.D
-	)
-
-	ContextActionService:BindActionAtPriority(
-		ACTION_UP,
-		movementHandler("Up"),
-		false,
-		CONFIG.InputPriority,
-		Enum.KeyCode.E
-	)
-
-	ContextActionService:BindActionAtPriority(
-		ACTION_DOWN,
-		movementHandler("Down"),
-		false,
-		CONFIG.InputPriority,
-		Enum.KeyCode.Q
-	)
-
-	state.InputBound = true
-end
-
-stopFlight = function(clearRequest)
-	if clearRequest ~= false then
-		state.Requested = false
-	end
-
-	state.Active = false
-
-	disconnect("FlightSimulation")
-
-	unbindFlightInput()
-
-	disconnect("NoclipDescendant")
-
-	local linearVelocity =
-		state.LinearVelocity
-
-	if linearVelocity
-		and linearVelocity.Parent then
-
-		linearVelocity.VectorVelocity =
-			Vector3.zero
-	end
-
-	destroyFlightObjects()
-
-	local humanoid =
-		state.Humanoid
-
-	if humanoid
-		and humanoid.Parent then
-
-		humanoid.AutoRotate =
-			state.PreviousAutoRotate
-	end
-
-	restoreCharacterProperties()
-
-	state.Velocity = Vector3.zero
-
-	local rootPart =
-		state.RootPart
-
-	if rootPart
-		and rootPart.Parent
-		and not rootPart.Anchored then
-
-		rootPart.AssemblyLinearVelocity =
-			Vector3.zero
-
-		rootPart.AssemblyAngularVelocity =
-			Vector3.zero
-	end
-
-	updateFlyButton()
-end
-
-startFlight = function(preserveRequest)
-	if state.Destroying
-		or state.Active then
-		return false
-	end
-
-	if not isCharacterValid() then
-		if not preserveRequest then
-			state.Requested = false
-		end
-
-		return false
-	end
-
-	local humanoid =
-		state.Humanoid
-
-	if not humanoid
-		or humanoid.Health <= 0 then
-
-		if not preserveRequest then
-			state.Requested = false
-		end
-
-		return false
-	end
-
-	state.Requested = true
-	state.Active = false
-	state.Velocity = Vector3.zero
-
-	saveCharacterProperties()
-
-	state.PreviousAutoRotate =
-		humanoid.AutoRotate
-
-	humanoid.AutoRotate = false
-
-	setupNoclip()
-
-	if not createFlightObjects() then
-		disconnect("NoclipDescendant")
-
-		restoreCharacterProperties()
-
-		if humanoid.Parent then
-			humanoid.AutoRotate =
-				state.PreviousAutoRotate
-		end
-
-		state.Velocity = Vector3.zero
-		state.Active = false
-
-		state.Requested =
-			preserveRequest == true
-
-		updateFlyButton()
-
-		return false
-	end
-
-	state.Active = true
-
-	applyTransparencyToSavedParts()
-
-	bindFlightInput()
-
-	connect(
-		"FlightSimulation",
-		RunService.PreSimulation,
-		updateFlight
-	)
-
-	updateFlyButton()
-
-	return true
-end
-
-local function toggleFlight()
-	if state.Destroying then
-		return
-	end
-
-	if state.Active then
-		stopFlight(true)
-	else
-		startFlight(false)
-	end
-end
-
-local function updateSpeedUI()
-	local range =
-		CONFIG.MaxSpeed - CONFIG.MinSpeed
-
-	local normalized = 0
-
-	if range > 0 then
-		normalized =
-			(state.Speed - CONFIG.MinSpeed)
-			/ range
-	end
-
-	normalized =
-		math.clamp(
-			normalized,
-			0,
-			1
-		)
-
-	local handleWidth =
-		speedHandle.AbsoluteSize.X
-
-	local sliderWidth =
-		speedSlider.AbsoluteSize.X
-
-	local radius =
-		handleWidth * 0.5
-
-	local usableWidth =
-		math.max(
-			0,
-			sliderWidth - handleWidth
-		)
-
-	local handleOffset =
-		normalized * usableWidth
-
-	speedBar.Size =
-		UDim2.new(
-			normalized,
-			0,
-			1,
-			0
-		)
-
-	speedHandle.Position =
-		UDim2.new(
-			0,
-			handleOffset,
-			0.5,
-			-radius
-		)
-
-	speedLabel.Text =
-		string.format(
-			"Speed: %d",
-			math.round(state.Speed)
-		)
-end
-
-local speedDragging = false
-
-local function updateSpeedFromMouse()
-	local sliderWidth =
-		speedSlider.AbsoluteSize.X
-
-	local handleWidth =
-		speedHandle.AbsoluteSize.X
-
-	local usableWidth =
-		sliderWidth - handleWidth
-
-	if usableWidth <= 0 then
-		return
-	end
-
-	local mouseX =
-		UserInputService:GetMouseLocation().X
-
-	local localX =
-		mouseX
-		- speedSlider.AbsolutePosition.X
-
-	local handleRadius =
-		handleWidth * 0.5
-
-	local percentage =
-		(localX - handleRadius)
-		/ usableWidth
-
-	percentage =
-		math.clamp(
-			percentage,
-			0,
-			1
-		)
-
-	state.Speed =
-		CONFIG.MinSpeed
-		+
-		(
-			CONFIG.MaxSpeed
-			- CONFIG.MinSpeed
-		)
-		* percentage
-
-	updateSpeedUI()
-end
-
-connect(
-	"SpeedHandleBegin",
-	speedHandle.InputBegan,
-	function(inputObject)
-		if inputObject.UserInputType
-			== Enum.UserInputType.MouseButton1 then
-
-			speedDragging = true
-			updateSpeedFromMouse()
-		end
-	end
-)
-
-connect(
-	"SpeedSliderBegin",
-	speedSlider.InputBegan,
-	function(inputObject)
-		if inputObject.UserInputType
-			== Enum.UserInputType.MouseButton1 then
-
-			speedDragging = true
-			updateSpeedFromMouse()
-		end
-	end
-)
-
-connect(
-	"SpeedMouseMove",
-	UserInputService.InputChanged,
-	function(inputObject)
-		if not speedDragging then
-			return
-		end
-
-		if inputObject.UserInputType
-			== Enum.UserInputType.MouseMovement then
-
-			updateSpeedFromMouse()
-		end
-	end
-)
-
-connect(
-	"SpeedMouseEnd",
-	UserInputService.InputEnded,
-	function(inputObject)
-		if inputObject.UserInputType
-			== Enum.UserInputType.MouseButton1 then
-
-			speedDragging = false
-		end
-	end
-)
-
-connect(
-	"TransparencyFocusLost",
-	transparencyBox.FocusLost,
-	function()
-		local text =
-			string.gsub(
-				transparencyBox.Text,
-				",",
-				"."
-			)
-
-		local value = tonumber(text)
-
-		if value == nil then
-			transparencyBox.Text =
-				tostring(state.Transparency)
-
-			return
-		end
-
-		state.Transparency =
-			math.clamp(
-				value,
-				0,
-				1
-			)
-
-		transparencyBox.Text =
-			tostring(state.Transparency)
-
-		applyTransparencyToSavedParts()
-	end
-)
-
-local draggingGUI = false
-local dragStart = nil
-local startPosition = nil
-
-local function clampGUIPosition(position)
-	local camera =
-		workspace.CurrentCamera
-
-	if not camera then
-		return position
-	end
-
-	local viewport =
-		camera.ViewportSize
-
-	local frameSize =
-		mainFrame.AbsoluteSize
-
-	local margin =
-		CONFIG.GUI_MARGIN
-
-	local absoluteX =
-		position.X.Scale * viewport.X
-		+ position.X.Offset
-
-	local absoluteY =
-		position.Y.Scale * viewport.Y
-		+ position.Y.Offset
-
-	local maxX =
-		math.max(
-			margin,
-			viewport.X
-				- frameSize.X
-				- margin
-		)
-
-	local maxY =
-		math.max(
-			margin,
-			viewport.Y
-				- frameSize.Y
-				- margin
-		)
-
-	absoluteX =
-		math.clamp(
-			absoluteX,
-			margin,
-			maxX
-		)
-
-	absoluteY =
-		math.clamp(
-			absoluteY,
-			margin,
-			maxY
-		)
-
-	return UDim2.fromOffset(
-		absoluteX,
-		absoluteY
-	)
-end
-
-connect(
-	"DragBegin",
-	dragArea.InputBegan,
-	function(inputObject)
-		if inputObject.UserInputType
-			== Enum.UserInputType.MouseButton1 then
-
-			draggingGUI = true
-			dragStart = inputObject.Position
-			startPosition = mainFrame.Position
-		end
-	end
-)
-
-connect(
-	"DragChanged",
-	UserInputService.InputChanged,
-	function(inputObject)
-		if not draggingGUI then
-			return
-		end
-
-		if inputObject.UserInputType
-			~= Enum.UserInputType.MouseMovement then
-			return
-		end
-
-		if not dragStart
-			or not startPosition then
-			return
-		end
-
-		local delta =
-			inputObject.Position - dragStart
-
-		local newPosition =
-			UDim2.new(
-				startPosition.X.Scale,
-				startPosition.X.Offset + delta.X,
-				startPosition.Y.Scale,
-				startPosition.Y.Offset + delta.Y
-			)
-
-		mainFrame.Position =
-			clampGUIPosition(
-				newPosition
-			)
-	end
-)
-
-connect(
-	"DragEnded",
-	UserInputService.InputEnded,
-	function(inputObject)
-		if inputObject.UserInputType
-			== Enum.UserInputType.MouseButton1 then
-
-			draggingGUI = false
-			dragStart = nil
-			startPosition = nil
-		end
-	end
-)
-
-local function clearTransientUIInput()
-	speedDragging = false
-
-	draggingGUI = false
-	dragStart = nil
-	startPosition = nil
-end
-
-connect(
-	"TextBoxFocused",
-	UserInputService.TextBoxFocused,
-	function()
-		resetInput()
-
-		if state.LinearVelocity
-			and state.LinearVelocity.Parent then
-
-			state.LinearVelocity.VectorVelocity =
-				Vector3.zero
-		end
-	end
-)
-
-connect(
-	"TextBoxFocusReleased",
-	UserInputService.TextBoxFocusReleased,
-	function()
-		resetInput()
-	end
-)
-
-connect(
-	"WindowFocusReleased",
-	UserInputService.WindowFocusReleased,
-	function()
-		resetInput()
-		clearTransientUIInput()
-
-		if state.Active
-			and state.LinearVelocity
-			and state.LinearVelocity.Parent then
-
-			state.LinearVelocity.VectorVelocity =
-				Vector3.zero
-		end
-	end
-)
-
-local function bindCharacterEvents()
-	disconnect("HumanoidDied")
-	disconnect("HumanoidAncestry")
-	disconnect("RootAncestry")
-
-	local humanoid =
-		state.Humanoid
-
-	local rootPart =
-		state.RootPart
-
-	if humanoid then
-		connect(
-			"HumanoidDied",
-			humanoid.Died,
-			function()
-				if state.Destroying then
-					return
-				end
-
-				if state.Active then
-					stopFlight(false)
-				else
-					resetInput()
-				end
-			end
-		)
-
-		connect(
-			"HumanoidAncestry",
-			humanoid.AncestryChanged,
-			function(_, parent)
-				if parent == nil
-					and not state.Destroying then
-
-					if state.Active then
-						stopFlight(false)
-					else
-						resetInput()
-					end
-				end
-			end
-		)
-	end
-
-	if rootPart then
-		connect(
-			"RootAncestry",
-			rootPart.AncestryChanged,
-			function(_, parent)
-				if parent == nil
-					and not state.Destroying then
-
-					if state.Active then
-						stopFlight(false)
-					else
-						resetInput()
-					end
-				end
-			end
-		)
-	end
-end
-
-local function prepareCharacter(newCharacter)
-	state.CharacterToken += 1
-
-	local token =
-		state.CharacterToken
-
-	local shouldResume =
-		state.Requested
-
-	stopFlight(false)
-	resetInput()
-
-	disconnect("HumanoidDied")
-	disconnect("HumanoidAncestry")
-	disconnect("RootAncestry")
-
-	state.Character = nil
-	state.Humanoid = nil
-	state.RootPart = nil
-
-	table.clear(state.SavedParts)
-
-	return token, shouldResume
-end
-
-local function tryLoadCharacter(
-	character,
-	token,
-	shouldResume
-)
-	for attempt = 1, CONFIG.CharacterRetryCount do
-		if state.Destroying then
-			return
-		end
-
-		if token ~= state.CharacterToken then
-			return
-		end
-
-		if player.Character ~= character then
-			return
-		end
-
-		local timeout
-
-		if attempt == 1 then
-			timeout =
-				CONFIG.CharacterLoadTimeout
-		else
-			timeout = math.min(
-				CONFIG.CharacterLoadTimeout,
-				3
-			)
-		end
-
-		if loadCharacter(
-			character,
-			timeout
-		) then
-
-			bindCharacterEvents()
-
-			task.defer(function()
-				if state.Destroying then
-					return
-				end
-
-				if token ~= state.CharacterToken then
-					return
-				end
-
-				if state.Character ~= character then
-					return
-				end
-
-				if shouldResume
-					and state.Requested then
-
-					startFlight(true)
-				else
-					updateFlyButton()
-				end
-			end)
-
-			return
-		end
-
-		if attempt < CONFIG.CharacterRetryCount then
-			task.wait(
-				CONFIG.CharacterRetryDelay
-			)
-		end
-	end
-
-	if token == state.CharacterToken then
-		state.Requested =
-			shouldResume
-
-		updateFlyButton()
-	end
-end
-
-connect(
-	"CharacterAdded",
-	player.CharacterAdded,
-	function(newCharacter)
-		if state.Destroying then
-			return
-		end
-
-		local token, shouldResume =
-			prepareCharacter(
-				newCharacter
-			)
-
-		task.spawn(function()
-			tryLoadCharacter(
-				newCharacter,
-				token,
-				shouldResume
-			)
-		end)
-	end
-)
-
-connect(
-	"CharacterRemoving",
-	player.CharacterRemoving,
-	function(character)
-		if state.Destroying then
-			return
-		end
-
-		if character ~= state.Character then
-			return
-		end
-
-		state.CharacterToken += 1
-
-		stopFlight(false)
-		resetInput()
-
-		disconnect("HumanoidDied")
-		disconnect("HumanoidAncestry")
-		disconnect("RootAncestry")
-
-		state.Character = nil
-		state.Humanoid = nil
-		state.RootPart = nil
-
-		table.clear(state.SavedParts)
-	end
-)
-
--- Souris uniquement pour l'interface.
-connect(
-	"FlyButton",
-	flyButton.MouseButton1Click,
-	function()
-		toggleFlight()
-	end
-)
-
-local minimized = false
-local minimizeTween = nil
-
-connect(
-	"Minimize",
-	minimizeButton.MouseButton1Click,
-	function()
-		if state.Destroying then
-			return
-		end
-
-		state.UIToken += 1
-
-		local token =
-			state.UIToken
-
-		minimized = not minimized
-
-		local targetSize
-
-		if minimized then
-			targetSize =
-				UDim2.fromOffset(
-					CONFIG.GUIWidth,
-					42
-				)
-		else
-			targetSize =
-				UDim2.fromOffset(
-					CONFIG.GUIWidth,
-					CONFIG.GUIHeight
-				)
-
-			body.Visible = true
-		end
-
-		if minimizeTween then
-			minimizeTween:Cancel()
-			minimizeTween = nil
-		end
-
-		minimizeTween =
-			TweenService:Create(
-				mainFrame,
-				TweenInfo.new(
-					0.2,
-					Enum.EasingStyle.Quad,
-					Enum.EasingDirection.Out
-				),
-				{
-					Size = targetSize,
-				}
-			)
-
-		minimizeTween:Play()
-
-		if minimized then
-			task.delay(
-				0.2,
-				function()
-					if state.Destroying then
-						return
-					end
-
-					if state.UIToken ~= token then
-						return
-					end
-
-					if minimized then
-						body.Visible = false
-					end
-				end
-			)
-		end
-	end
-)
-
-local function destroy()
-	if state.Destroying then
-		return
-	end
-
-	state.Destroying = true
-
-	state.CharacterToken += 1
-	state.UIToken += 1
-
-	state.Requested = false
-
-	resetInput()
-	clearTransientUIInput()
-
-	stopFlight(true)
-
-	disconnectAll()
-
-	restoreCharacterProperties()
-	destroyFlightObjects()
-
-	state.Character = nil
-	state.Humanoid = nil
-	state.RootPart = nil
-
-	table.clear(state.SavedParts)
-
-	if minimizeTween then
-		minimizeTween:Cancel()
-		minimizeTween = nil
-	end
-
-	if screenGui then
-		screenGui:Destroy()
-	end
-end
-
-connect(
-	"Close",
-	closeButton.MouseButton1Click,
-	destroy
-)
-
-local function clampCurrentGUIPosition()
-	if state.Destroying then
-		return
-	end
-
-	if not screenGui.Parent then
-		return
-	end
-
-	mainFrame.Position =
-		clampGUIPosition(
-			mainFrame.Position
-		)
-end
-
-local function bindViewport()
-	disconnect("ViewportChanged")
-
-	local camera =
-		workspace.CurrentCamera
-
-	if not camera then
-		return
-	end
-
-	connect(
-		"ViewportChanged",
-		camera:GetPropertyChangedSignal(
-			"ViewportSize"
-		),
-		clampCurrentGUIPosition
-	)
-end
-
-connect(
-	"CurrentCameraChanged",
-	workspace:GetPropertyChangedSignal(
-		"CurrentCamera"
-	),
-	function()
-		bindViewport()
-		clampCurrentGUIPosition()
-	end
-)
-
-bindViewport()
-
-local initialCharacter =
-	player.Character
-
-if not initialCharacter then
-	initialCharacter =
-		player.CharacterAdded:Wait()
-end
-
-if state.Destroying then
-	return
-end
-
-if not loadCharacter(
-	initialCharacter,
-	CONFIG.CharacterLoadTimeout
-) then
-
-	local loaded = false
-
-	for attempt = 1,
-		CONFIG.CharacterRetryCount do
-
-		if state.Destroying then
-			return
-		end
-
-		task.wait(
-			CONFIG.CharacterRetryDelay
-		)
-
-		if player.Character ~= initialCharacter then
-			break
-		end
-
-		if loadCharacter(
-			initialCharacter,
-			math.min(
-				CONFIG.CharacterLoadTimeout,
-				3
-			)
-		) then
-
-			loaded = true
-			break
-		end
-	end
-
-	if not loaded then
-		destroy()
-		return
-	end
-end
-
-bindCharacterEvents()
-
-mainFrame.Position =
-	clampGUIPosition(
-		mainFrame.Position
-	)
-
-updateSpeedUI()
-updateFlyButton()
+bindHumanoidSignals(humanoid)
+
+player.CharacterAdded:Connect(function(newChar)
+    if FLYING then stopFly() end
+    character = newChar
+    humanoid = newChar:WaitForChild("Humanoid")
+    rootPart = newChar:WaitForChild("HumanoidRootPart")
+    bindHumanoidSignals(humanoid)
+    if humanoid then
+        humanoid.PlatformStand = false
+        pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+    end
+    if isFlyToggledOn then
+        task.wait(0.1)
+        if isFlyToggledOn and character == newChar then
+            setFlying(true)
+        end
+    end
+end)
+
+--// GUI events
+closeButton.MouseButton1Click:Connect(function()
+    setFlying(false)
+    _G.FlyGuiV8Loaded = false
+    screenGui:Destroy()
+end)
+
+flyButton.MouseButton1Click:Connect(function()
+    setFlying(not isFlyToggledOn)
+end)
+
+cframeToggle.MouseButton1Click:Connect(function()
+    useCFrameFly = not useCFrameFly
+    paintCFButton()
+    if isFlyToggledOn and FLYING then
+        stopFly()
+        task.wait()
+        if isFlyToggledOn and character and character.Parent then
+            captureAndApplyFlyVisual(true)
+            if useCFrameFly then startCFrameFlyLoop() else startBodyMoverFlyLoop() end
+        end
+    end
+end)
+
+local isMinimized = false
+minimizeButton.MouseButton1Click:Connect(function()
+    isMinimized = not isMinimized
+    bodyFrame.Visible = not isMinimized
+    local target = isMinimized and UDim2.new(0, 250, 0, 40) or UDim2.new(0, 250, 0, 170)
+    TweenService:Create(mainFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {Size = target}):Play()
+end)
+
+transparencyBox.FocusLost:Connect(function()
+    local num = tonumber(transparencyBox.Text)
+    if num and num >= 0 and num <= 1 then
+        flyTransparency = num
+        applyTransparencyLive()
+    else
+        transparencyBox.Text = tostring(flyTransparency)
+    end
+end)
+
+local isDraggingSlider = false
+sliderHandle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        isDraggingSlider = true
+        updateSlider(input)
+    end
+end)
+speedSlider.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        isDraggingSlider = true
+        updateSlider(input)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        isDraggingSlider = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if isDraggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        updateSlider(input)
+    end
+end)
