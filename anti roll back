@@ -1,509 +1,342 @@
--- azerty098890 — rollback-hardened build
--- Toggle fly: P or the Fly button. Move: W/A/S/D (camera-relative), Q/E down/up.
--- Speed: ^ = +10, $ = -10 (AZERTY and QWERTY). Ctrl+wheel resizes the GUI.
--- Rollback mitigations: speed capped under 16, accel clamped, movers on Head, Freefall fed, ownership reaffirmed.
--- No noclip, no CF mode, no PlatformStand, no anchored head — those are the patterns that get detected.
+--!native
+-- If executor crashes on load, remove the line above
 
-if _G.RollbackFlyLoaded then return end
-_G.RollbackFlyLoaded = true
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
 
-local Players          = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local RunService       = game:GetService("RunService")
-local TweenService     = game:GetService("TweenService")
+local LP  = Players.LocalPlayer
+local Cam = workspace.CurrentCamera
 
-local player = Players.LocalPlayer
-if not player.Character then player.CharacterAdded:Wait() end
-local character = player.Character
-local humanoid  = character:WaitForChild("Humanoid")
-local rootPart  = character:WaitForChild("HumanoidRootPart")
+local V2, V3       = Vector2.new, Vector3.new
+local C3RGB        = Color3.fromRGB
+local max          = math.max
+local clock        = os.clock
 
---// Config
-local CONFIG = {
-    TOGGLE_KEY    = Enum.KeyCode.P,
-    MIN_SPEED     = 1,
-    MAX_SPEED     = 500,
-    SAFE_SPEED    = 14,   -- effective speed = min(flySpeed, SAFE_SPEED)
-    DEFAULT_SPEED = 50,
-    SPEED_STEP    = 10,
-    DEFAULT_TRANSP = 0.75,
-    ACCEL         = 40,   -- studs/s^2, accel clamp
-    FEED_FREEFALL = true,
-    REAFFIRM_NET  = true,
-    HEAD_PARENT   = true,
-    UI_SCALE_MIN  = 0.5,
-    UI_SCALE_MAX  = 2.0,
-    UI_SCALE_STEP = 0.1,
-}
+local DEFAULT_COL = C3RGB(255, 255, 255)
+local HP_HIGH     = C3RGB(0, 255, 120)
+local HP_MED      = C3RGB(255, 200, 50)
+local HP_LOW      = C3RGB(255, 60, 60)
+local TOOL_COL    = C3RGB(255, 220, 150)
+local BG_COL      = Color3.new(0, 0, 0)
+local OUTLINE_COL = Color3.new(0, 0, 0)
 
--- ^ / $ on AZERTY = LeftBracket / RightBracket. On QWERTY = Six / Four.
-local SPEED_UP_KEYS   = {Enum.KeyCode.Six, Enum.KeyCode.LeftBracket}
-local SPEED_DOWN_KEYS = {Enum.KeyCode.Four, Enum.KeyCode.RightBracket}
+local FONT_SIZE = 13
+local LINE_H    = 15
+local PAD       = 3
+local T_TEXT    = 0.15
 
-local flySpeed        = CONFIG.DEFAULT_SPEED
-local flyTransparency = CONFIG.DEFAULT_TRANSP
-local FLYING          = false
-local flyGen          = 0
-local bodyLoopConn, currentGyro, currentVel
-local smoothVel       = Vector3.new(0, 0, 0)
+local ENABLED    = true
+local SHUTDOWN   = false
+local TOGGLE_KEY = Enum.KeyCode.RightShift
+local CLOSE_KEY  = Enum.KeyCode.End
 
-local CONTROL = {F = 0, B = 0, L = 0, R = 0, Q = 0, E = 0}
+local profileBegin = (debug and debug.profilebegin) or function() end
+local profileEnd   = (debug and debug.profileend)   or function() end
 
-local function resetControls()
-    CONTROL.F, CONTROL.B, CONTROL.L, CONTROL.R, CONTROL.Q, CONTROL.E = 0, 0, 0, 0, 0, 0
-end
+local Connections = {}
+local function track(c) Connections[#Connections+1] = c; return c end
 
-local function effectiveSpeed()
-    return math.min(flySpeed, CONFIG.SAFE_SPEED)
-end
-
---// GUI
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "azerty098890"
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
-screenGui.ResetOnSpawn = false
-screenGui.IgnoreGuiInset = true
-screenGui.Parent = player:WaitForChild("PlayerGui")
-
-local uiScale = Instance.new("UIScale", screenGui)
-uiScale.Scale = 1
-
-local mainFrame = Instance.new("Frame")
-mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 250, 0, 195)
-mainFrame.Position = UDim2.new(0.5, -125, 0.2, 0)
-mainFrame.BackgroundColor3 = Color3.fromRGB(30, 32, 35)
-mainFrame.BorderSizePixel = 0
-mainFrame.ClipsDescendants = true
-mainFrame.Parent = screenGui
-Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
-local uiStroke = Instance.new("UIStroke", mainFrame)
-uiStroke.Thickness = 2
-uiStroke.Color = Color3.fromRGB(0, 0, 0)
-
-local headerFrame = Instance.new("Frame", mainFrame)
-headerFrame.Size = UDim2.new(1, 0, 0, 40)
-headerFrame.BackgroundTransparency = 1
-
-local titleLabel = Instance.new("TextLabel", headerFrame)
-titleLabel.Size = UDim2.new(1, -60, 1, 0)
-titleLabel.BackgroundTransparency = 1
-titleLabel.Font = Enum.Font.GothamBold
-titleLabel.Text = "azerty098890"
-titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-titleLabel.TextSize = 18
-titleLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-local closeButton = Instance.new("TextButton", headerFrame)
-closeButton.Size = UDim2.new(0, 12, 0, 12)
-closeButton.Position = UDim2.new(1, -22, 0.5, -6)
-closeButton.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
-closeButton.Text = ""
-Instance.new("UICorner", closeButton).CornerRadius = UDim.new(1, 0)
-
-local minimizeButton = Instance.new("TextButton", headerFrame)
-minimizeButton.Size = UDim2.new(0, 12, 0, 12)
-minimizeButton.Position = UDim2.new(1, -40, 0.5, -6)
-minimizeButton.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
-minimizeButton.Text = ""
-Instance.new("UICorner", minimizeButton).CornerRadius = UDim.new(1, 0)
-
-local bodyFrame = Instance.new("Frame", mainFrame)
-bodyFrame.Size = UDim2.new(1, 0, 1, -40)
-bodyFrame.Position = UDim2.new(0, 0, 0, 40)
-bodyFrame.BackgroundTransparency = 1
-
-local flyButton = Instance.new("TextButton", bodyFrame)
-flyButton.Size = UDim2.new(1, -20, 0, 35)
-flyButton.Position = UDim2.new(0, 10, 0, 10)
-flyButton.BackgroundColor3 = Color3.fromRGB(44, 46, 51)
-flyButton.Font = Enum.Font.Gotham
-flyButton.Text = "Fly"
-flyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-flyButton.TextSize = 16
-Instance.new("UICorner", flyButton).CornerRadius = UDim.new(0, 6)
-local flyStroke = Instance.new("UIStroke", flyButton)
-flyStroke.Color = Color3.fromRGB(20, 20, 20)
-
-local speedSliderLabel = Instance.new("TextLabel", bodyFrame)
-speedSliderLabel.Size = UDim2.new(1, -20, 0, 20)
-speedSliderLabel.Position = UDim2.new(0, 10, 0, 55)
-speedSliderLabel.BackgroundTransparency = 1
-speedSliderLabel.Font = Enum.Font.Gotham
-speedSliderLabel.Text = ""
-speedSliderLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-speedSliderLabel.TextSize = 14
-speedSliderLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-local speedSlider = Instance.new("Frame", bodyFrame)
-speedSlider.Size = UDim2.new(1, -20, 0, 6)
-speedSlider.Position = UDim2.new(0, 10, 0, 80)
-speedSlider.BackgroundColor3 = Color3.fromRGB(20, 22, 25)
-Instance.new("UICorner", speedSlider).CornerRadius = UDim.new(0, 3)
-
-local sliderBar = Instance.new("Frame", speedSlider)
-sliderBar.Size = UDim2.new(0, 0, 1, 0)
-sliderBar.BackgroundColor3 = Color3.fromRGB(114, 137, 218)
-Instance.new("UICorner", sliderBar).CornerRadius = UDim.new(0, 3)
-
-local sliderHandle = Instance.new("TextButton", speedSlider)
-sliderHandle.Size = UDim2.new(0, 18, 0, 18)
-sliderHandle.Position = UDim2.new(0, -9, 0.5, -9)
-sliderHandle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-sliderHandle.Text = ""
-Instance.new("UICorner", sliderHandle).CornerRadius = UDim.new(1, 0)
-
-local transparencyLabel = Instance.new("TextLabel", bodyFrame)
-transparencyLabel.Size = UDim2.new(0.5, -15, 0, 30)
-transparencyLabel.Position = UDim2.new(0, 10, 0, 95)
-transparencyLabel.BackgroundTransparency = 1
-transparencyLabel.Font = Enum.Font.Gotham
-transparencyLabel.Text = "Transparency:"
-transparencyLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-transparencyLabel.TextSize = 14
-transparencyLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-local transparencyBox = Instance.new("TextBox", bodyFrame)
-transparencyBox.Size = UDim2.new(0.5, -15, 0, 30)
-transparencyBox.Position = UDim2.new(0.5, 5, 0, 95)
-transparencyBox.BackgroundColor3 = Color3.fromRGB(20, 22, 25)
-transparencyBox.Font = Enum.Font.Gotham
-transparencyBox.Text = tostring(CONFIG.DEFAULT_TRANSP)
-transparencyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-transparencyBox.TextSize = 14
-transparencyBox.ClearTextOnFocus = false
-Instance.new("UICorner", transparencyBox).CornerRadius = UDim.new(0, 4)
-
-local stealthStatus = Instance.new("TextLabel", bodyFrame)
-stealthStatus.Size = UDim2.new(1, -20, 0, 20)
-stealthStatus.Position = UDim2.new(0, 10, 1, -28)
-stealthStatus.BackgroundTransparency = 1
-stealthStatus.Font = Enum.Font.Gotham
-stealthStatus.Text = "stealth: cap " .. CONFIG.SAFE_SPEED .. " u/s"
-stealthStatus.TextColor3 = Color3.fromRGB(88, 200, 120)
-stealthStatus.TextSize = 12
-stealthStatus.TextXAlignment = Enum.TextXAlignment.Left
-
---// Speed slider
-local function paintSpeedSlider()
-    local range = CONFIG.MAX_SPEED - CONFIG.MIN_SPEED
-    local p = range > 0 and (flySpeed - CONFIG.MIN_SPEED) / range or 0
-    sliderBar.Size = UDim2.new(p, 0, 1, 0)
-    sliderHandle.Position = UDim2.new(p, -9, 0.5, -9)
-    local eff = effectiveSpeed()
-    if flySpeed > CONFIG.SAFE_SPEED then
-        speedSliderLabel.Text = string.format("Speed: %.0f  (capped %.0f)", flySpeed, eff)
-    else
-        speedSliderLabel.Text = string.format("Speed: %.0f", flySpeed)
+local DIST_CACHE = {}
+local function distStr(d)
+    local i = d // 1
+    local s = DIST_CACHE[i]
+    if not s then
+        s = i .. "m"
+        if i < 2000 then DIST_CACHE[i] = s end
     end
+    return s
 end
 
-local function setSpeed(v)
-    flySpeed = math.clamp(v, CONFIG.MIN_SPEED, CONFIG.MAX_SPEED)
-    paintSpeedSlider()
+local function newDraw(cls)
+    local ok, o = pcall(Drawing.new, cls)
+    return ok and o or nil
 end
 
-local function updateSlider(input)
-    local width = speedSlider.AbsoluteSize.X
-    if width <= 0 then return end
-    local x = math.clamp(input.Position.X - speedSlider.AbsolutePosition.X, 0, width)
-    local p = x / width
-    setSpeed(CONFIG.MIN_SPEED + p * (CONFIG.MAX_SPEED - CONFIG.MIN_SPEED))
+local function setp(obj, prop, val)
+    if obj then pcall(function() obj[prop] = val end) end
 end
 
-paintSpeedSlider()
+local function hashToColor(str)
+    local h = 0
+    for i = 1, #str do
+        h = (h * 31 + str:byte(i)) % 16777216
+    end
+    local r = h // 65536 % 256
+    local g = h // 256 % 256
+    local b = h % 256
+    if r + g + b < 300 then
+        r = (r + 100 > 255) and 255 or r + 100
+        g = (g + 100 > 255) and 255 or g + 100
+        b = (b + 100 > 255) and 255 or b + 100
+    end
+    return C3RGB(r, g, b)
+end
 
---// Drag
-local function makeDraggable(guiObject, dragHandle)
-    local dragging, dragStart, startPos
-    dragHandle.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = guiObject.Position
-        end
+local function resolveTeam(plr)
+    local t = plr.Team
+    if t then
+        local tc = plr.TeamColor
+        return t.Name, tc and tc.Color or hashToColor(t.Name)
+    end
+    local ok, v = pcall(function()
+        return plr:GetAttribute("Team") or plr:GetAttribute("Job")
+            or plr:GetAttribute("Role") or plr:GetAttribute("Class")
     end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            guiObject.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-        end
-    end)
-end
-makeDraggable(mainFrame, headerFrame)
-
---// Transparency
-local savedTransp = setmetatable({}, {__mode = "k"})
-
-local function applyTransparency()
-    if not character then return end
-    for _, part in ipairs(character:GetDescendants()) do
-        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-            if part.Transparency ~= flyTransparency then
-                if savedTransp[part] == nil then
-                    savedTransp[part] = part.Transparency
-                end
-                part.Transparency = flyTransparency
+    if ok and v ~= nil then
+        local s = tostring(v)
+        return s, hashToColor(s)
+    end
+    local sources = { plr }
+    if plr.Character then sources[#sources+1] = plr.Character end
+    for _, src in ipairs(sources) do
+        for _, name in ipairs({"Team","Job","Role","Class","Occupation"}) do
+            local obj = src:FindFirstChild(name)
+            if obj and obj:IsA("StringValue") and obj.Value ~= "" then
+                return obj.Value, hashToColor(obj.Value)
             end
         end
     end
+    return nil, nil
 end
 
-local function restoreTransparency()
-    for part, t in pairs(savedTransp) do
-        if part and part.Parent then part.Transparency = t end
-    end
-    savedTransp = setmetatable({}, {__mode = "k"})
-end
-
---// Helpers
-local function getMoveVector()
-    local cam = workspace.CurrentCamera
-    if not cam then return Vector3.new(0, 0, 0) end
-    local cf = cam.CFrame
-    local move = cf.LookVector * (CONTROL.F + CONTROL.B)
-        + cf.RightVector * (CONTROL.L + CONTROL.R)
-        + Vector3.new(0, CONTROL.Q + CONTROL.E, 0)
-    if move.Magnitude > 1 then move = move.Unit end
-    return move
-end
-
-local function getMoverParent()
-    if CONFIG.HEAD_PARENT and character then
-        local head = character:FindFirstChild("Head")
-        if head and head:IsA("BasePart") then return head end
-    end
-    return rootPart
-end
-
-local function destroyBodyMovers()
-    if currentGyro then pcall(function() currentGyro:Destroy() end); currentGyro = nil end
-    if currentVel  then pcall(function() currentVel:Destroy()  end); currentVel  = nil end
-end
-
-local function feedFreefall()
-    if not CONFIG.FEED_FREEFALL then return end
-    if humanoid and humanoid.Parent then
-        pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Freefall) end)
+local playerList = {}
+local function rebuildPlayerList()
+    table.clear(playerList)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        playerList[#playerList+1] = plr
     end
 end
 
-local function reaffirmNet()
-    if not CONFIG.REAFFIRM_NET or not rootPart then return end
-    pcall(function() rootPart:SetNetworkOwner(player) end)
-end
+local cache, freePool = {}, {}
 
---// Start / stop
-local function startFly()
-    if FLYING then return end
-    local rp = getMoverParent()
-    if not rp or not humanoid then return end
-    FLYING = true
-    flyGen += 1
-    local gen = flyGen
-    smoothVel = Vector3.new(0, 0, 0)
-
-    local lockedRot = (rp.CFrame - rp.CFrame.Position).Rotation
-
-    local gyro = Instance.new("BodyGyro")
-    gyro.P = 9e4
-    gyro.D = 500
-    gyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
-    gyro.CFrame = rp.CFrame
-    gyro.Parent = rp
-    currentGyro = gyro
-
-    local vel = Instance.new("BodyVelocity")
-    vel.Velocity = Vector3.new(0, 0, 0)
-    vel.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-    vel.Parent = rp
-    currentVel = vel
-
-    reaffirmNet()
-    applyTransparency()
-
-    bodyLoopConn = RunService.Heartbeat:Connect(function(dt)
-        if gen ~= flyGen or not FLYING then
-            if bodyLoopConn then bodyLoopConn:Disconnect(); bodyLoopConn = nil end
-            destroyBodyMovers()
-            resetControls()
-            return
+local function buildObjs()
+    local o = {}
+    o.bg = newDraw("Square")
+    if o.bg then
+        o.bg.Filled = true
+        o.bg.Color = BG_COL
+        o.bg.Transparency = 0.5
+        o.bg.Visible = false
+    end
+    o.l1 = newDraw("Text")
+    o.l2 = newDraw("Text")
+    o.l3 = newDraw("Text")
+    for _, t in ipairs({o.l1, o.l2, o.l3}) do
+        if t then
+            t.Center = true
+            t.Outline = true
+            t.OutlineColor = OUTLINE_COL
+            t.Size = FONT_SIZE
+            t.Visible = false
         end
-        if not rp.Parent then return end
-
-        feedFreefall()
-
-        local desired = getMoveVector() * effectiveSpeed()
-        local dv = desired - smoothVel
-        local maxDv = CONFIG.ACCEL * dt
-        if dv.Magnitude > maxDv then dv = dv.Unit * maxDv end
-        smoothVel = smoothVel + dv
-        vel.Velocity = smoothVel
-
-        local cam = workspace.CurrentCamera
-        if cam then
-            local look = cam.CFrame.LookVector
-            local flat = Vector3.new(look.X, 0, look.Z)
-            if flat.Magnitude > 0.05 then
-                gyro.CFrame = CFrame.lookAt(rp.Position, rp.Position + flat.Unit)
-            else
-                gyro.CFrame = CFrame.new(rp.Position) * lockedRot
-            end
-        else
-            gyro.CFrame = CFrame.new(rp.Position) * lockedRot
+    end
+    pcall(function()
+        if Drawing.Fonts then
+            local f = Drawing.Fonts.Plex or Drawing.Fonts.System
+            if o.l1 then o.l1.Font = f end
+            if o.l2 then o.l2.Font = f end
+            if o.l3 then o.l3.Font = f end
         end
     end)
+    o.char=nil; o.head=nil; o.hrp=nil; o.hum=nil
+    o.teamName=nil; o.teamCol=nil; o.lastTeam=nil
+    o.tText=0; o.lastTool=nil
+    o.bw=nil
+    return o
 end
 
-local function stopFly()
-    if not FLYING then return end
-    FLYING = false
-    flyGen += 1
-    if bodyLoopConn then bodyLoopConn:Disconnect(); bodyLoopConn = nil end
-    destroyBodyMovers()
-    resetControls()
-    smoothVel = Vector3.new(0, 0, 0)
-    restoreTransparency()
+local function resetObj(o)
+    o.char=nil; o.head=nil; o.hrp=nil; o.hum=nil
+    o.teamName=nil; o.teamCol=nil; o.lastTeam=nil
+    o.tText=0; o.lastTool=nil
+    o.bw=nil
+    setp(o.bg, "Visible", false)
+    setp(o.l1, "Visible", false)
+    setp(o.l2, "Visible", false)
+    setp(o.l3, "Visible", false)
 end
 
-local function setFly(state)
-    if state then startFly() else stopFly() end
-    flyButton.TextColor3 = FLYING and Color3.fromRGB(88, 101, 242) or Color3.fromRGB(255, 255, 255)
-    flyStroke.Color = FLYING and Color3.fromRGB(88, 101, 242) or Color3.fromRGB(20, 20, 20)
-end
-
---// Keybinds
-local keyMap = {
-    [Enum.KeyCode.W] = "F", [Enum.KeyCode.S] = "B",
-    [Enum.KeyCode.A] = "L", [Enum.KeyCode.D] = "R",
-    [Enum.KeyCode.Q] = "Q", [Enum.KeyCode.E] = "E",
-}
-local valueMap = {
-    [Enum.KeyCode.W] =  1, [Enum.KeyCode.S] = -1,
-    [Enum.KeyCode.A] = -1, [Enum.KeyCode.D] =  1,
-    [Enum.KeyCode.Q] = -1, [Enum.KeyCode.E] =  1,
-}
-
-local function isSpeedUp(kc)
-    for _, k in ipairs(SPEED_UP_KEYS) do if kc == k then return true end end
-    return false
-end
-local function isSpeedDown(kc)
-    for _, k in ipairs(SPEED_DOWN_KEYS) do if kc == k then return true end end
-    return false
-end
-
-UserInputService.InputBegan:Connect(function(input, gpe)
-    if gpe or UserInputService:GetFocusedTextBox() then return end
-    if input.KeyCode == CONFIG.TOGGLE_KEY then
-        setFly(not FLYING)
-        return
+local function removeObj(o)
+    for _, key in ipairs({"bg","l1","l2","l3"}) do
+        local obj = o[key]
+        if obj then pcall(function() obj:Remove() end) end
     end
-    if isSpeedUp(input.KeyCode) then
-        setSpeed(flySpeed + CONFIG.SPEED_STEP)
-        return
-    end
-    if isSpeedDown(input.KeyCode) then
-        setSpeed(flySpeed - CONFIG.SPEED_STEP)
-        return
-    end
-    local k = keyMap[input.KeyCode]
-    if k then CONTROL[k] = valueMap[input.KeyCode] end
-end)
-UserInputService.InputEnded:Connect(function(input)
-    local k = keyMap[input.KeyCode]
-    if k then CONTROL[k] = 0 end
-end)
-
--- Ctrl+wheel resizes the GUI
-UserInputService.InputChanged:Connect(function(input)
-    if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
-    if not UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
-        and not UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then return end
-    local nextScale = uiScale.Scale + input.Position.Z * CONFIG.UI_SCALE_STEP
-    uiScale.Scale = math.clamp(nextScale, CONFIG.UI_SCALE_MIN, CONFIG.UI_SCALE_MAX)
-end)
-
---// Respawn / death
-local function bindHumanoid(h)
-    if not h then return end
-    h.Died:Connect(function()
-        if FLYING then setFly(false) end
-    end)
 end
-bindHumanoid(humanoid)
 
-player.CharacterAdded:Connect(function(newChar)
-    if FLYING then setFly(false) end
-    character = newChar
-    humanoid = newChar:WaitForChild("Humanoid")
-    rootPart = newChar:WaitForChild("HumanoidRootPart")
-    bindHumanoid(humanoid)
-end)
+local function getObjs(plr)
+    local o = cache[plr]
+    if not o then
+        o = table.remove(freePool, 1)
+        if o then resetObj(o) else o = buildObjs() end
+        cache[plr] = o
+    end
+    return o
+end
 
---// GUI events
-closeButton.MouseButton1Click:Connect(function()
-    setFly(false)
-    _G.RollbackFlyLoaded = false
-    screenGui:Destroy()
-end)
+local function hideAll(o)
+    setp(o.bg, "Visible", false)
+    setp(o.l1, "Visible", false)
+    setp(o.l2, "Visible", false)
+    setp(o.l3, "Visible", false)
+end
 
-flyButton.MouseButton1Click:Connect(function()
-    setFly(not FLYING)
-end)
+local function textWidth(t, fallback)
+    if not t then return fallback end
+    local ok, tb = pcall(function() return t.TextBounds end)
+    if ok and tb and tb.X and tb.X > 0 then return tb.X end
+    return fallback
+end
 
-local isMinimized = false
-minimizeButton.MouseButton1Click:Connect(function()
-    isMinimized = not isMinimized
-    bodyFrame.Visible = not isMinimized
-    local target = isMinimized and UDim2.new(0, 250, 0, 40) or UDim2.new(0, 250, 0, 195)
-    TweenService:Create(mainFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {Size = target}):Play()
-end)
+local function resolveChar(plr, o)
+    local char = plr.Character
+    if o.char == char and o.head and o.head.Parent == char then return true end
+    o.char = char
+    if not char then o.head=nil; o.hrp=nil; o.hum=nil; return false end
+    o.head = char:FindFirstChild("Head")
+    o.hrp  = char:FindFirstChild("HumanoidRootPart")
+    o.hum  = char:FindFirstChildOfClass("Humanoid")
+    return o.head ~= nil and o.hrp ~= nil and o.hum ~= nil
+end
 
-transparencyBox.FocusLost:Connect(function()
-    local num = tonumber(transparencyBox.Text)
-    if num and num >= 0 and num <= 1 then
-        flyTransparency = num
-        if FLYING then applyTransparency() end
+local function renderOne(plr, vp, camPos, now)
+    local o = getObjs(plr)
+    if plr == LP then hideAll(o); return end
+    if not resolveChar(plr, o) then hideAll(o); return end
+    if o.hum.Health <= 0 then hideAll(o); return end
+
+    local p3 = Cam:WorldToViewportPoint(o.head.Position + V3(0, 2.2, 0))
+    if p3.Z <= 0 then hideAll(o); return end
+    local margin = 200
+    if p3.X < -margin or p3.X > vp.X + margin
+    or p3.Y < -margin or p3.Y > vp.Y + margin then
+        hideAll(o); return
+    end
+
+    local doText = now >= o.tText
+    if doText then
+        o.tText = now + T_TEXT
+
+        if o.lastTeam ~= plr.Team or o.teamCol == nil then
+            o.lastTeam = plr.Team
+            o.teamName, o.teamCol = resolveTeam(plr)
+        end
+
+        local tool = o.char:FindFirstChildOfClass("Tool")
+        o.lastTool = tool and tool.Name or nil
+
+        local teamCol  = o.teamCol or DEFAULT_COL
+        local teamName = o.teamName
+        o.l1.Text  = teamName and ("[" .. teamName .. "] " .. plr.Name) or plr.Name
+        o.l1.Color = teamCol
+        if o.lastTool then
+            o.l2.Text  = o.lastTool
+            o.l2.Color = TOOL_COL
+        end
+        local pct = o.hum.Health / o.hum.MaxHealth
+        local hpCol = pct > 0.5 and HP_HIGH or pct > 0.25 and HP_MED or HP_LOW
+        o.l3.Text  = (o.hum.Health // 1) .. " HP  ·  " .. distStr((o.hrp.Position - camPos).Magnitude)
+        o.l3.Color = hpCol
+
+        local w1 = textWidth(o.l1, #o.l1.Text * 8)
+        local w3 = textWidth(o.l3, #o.l3.Text * 8)
+        local bw = max(w1, w3)
+        if o.lastTool then bw = max(bw, textWidth(o.l2, #o.lastTool * 8)) end
+        o.bw = bw + 10
+    end
+
+    local hasTool = o.lastTool ~= nil
+    local lines   = 2 + (hasTool and 1 or 0)
+    local blockH  = PAD * 2 + lines * LINE_H
+    local x = p3.X
+    local y = p3.Y - blockH - 6
+
+    o.l1.Position = V2(x, y + PAD); o.l1.Visible = true
+
+    local ny = y + PAD + LINE_H
+    if hasTool then
+        o.l2.Position = V2(x, ny); o.l2.Visible = true
+        ny = ny + LINE_H
     else
-        transparencyBox.Text = tostring(flyTransparency)
+        o.l2.Visible = false
     end
-end)
+    o.l3.Position = V2(x, ny); o.l3.Visible = true
 
-local isDraggingSlider = false
-sliderHandle.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        isDraggingSlider = true
-        updateSlider(input)
+    if o.bw then
+        o.bg.Size     = V2(o.bw, blockH)
+        o.bg.Position = V2(x - o.bw / 2, y)
+        o.bg.Visible  = true
+    else
+        o.bg.Visible = false
     end
-end)
-speedSlider.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        isDraggingSlider = true
-        updateSlider(input)
+end
+
+local function shutdown()
+    SHUTDOWN = true
+    ENABLED  = false
+    for plr, o in pairs(cache) do
+        hideAll(o)
+        removeObj(o)
+        cache[plr] = nil
     end
-end)
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        isDraggingSlider = false
+    for _, o in ipairs(freePool) do
+        removeObj(o)
     end
-end)
-UserInputService.InputChanged:Connect(function(input)
-    if isDraggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch) then
-        updateSlider(input)
+    freePool = {}
+    for _, c in ipairs(Connections) do
+        pcall(function() c:Disconnect() end)
     end
-end)
+    Connections = {}
+    print("[ESP] Shutdown.")
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if SHUTDOWN or not ENABLED then
+        if not SHUTDOWN then
+            for _, o in pairs(cache) do hideAll(o) end
+        end
+        return
+    end
+    local now    = clock()
+    local camPos = Cam.CFrame.Position
+    local vp     = Cam.ViewportSize
+
+    profileBegin("ESP_Render")
+    for i = 1, #playerList do
+        local plr = playerList[i]
+        if plr then pcall(renderOne, plr, vp, camPos, now) end
+    end
+    profileEnd()
+end))
+
+track(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    if workspace.CurrentCamera then Cam = workspace.CurrentCamera end
+end))
+
+track(Players.PlayerAdded:Connect(function() rebuildPlayerList() end))
+track(Players.PlayerRemoving:Connect(function(plr)
+    local o = cache[plr]
+    if o then
+        hideAll(o)
+        cache[plr] = nil
+        freePool[#freePool+1] = o
+    end
+    rebuildPlayerList()
+end))
+rebuildPlayerList()
+
+track(UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if SHUTDOWN then return end
+    if input.KeyCode == TOGGLE_KEY then
+        ENABLED = not ENABLED
+        if not ENABLED then
+            for _, o in pairs(cache) do hideAll(o) end
+        end
+        print("[ESP] " .. (ENABLED and "ON" or "OFF"))
+    elseif input.KeyCode == CLOSE_KEY then
+        shutdown()
+    end
+end))
+
+print("[ESP] Loaded. RightShift = toggle, End = shutdown.")
