@@ -1,18 +1,14 @@
--- azerty098890 — fly + noclip (optimized, behavior-identical)
+-- azerty098890 — fly + noclip (optimized, M fixed for AZERTY)
 -- P = fly toggle. M (AZERTY physical M) = switch engine. ^ = +10, $ = -10.
 -- Ctrl+wheel = GUI scale. Toggles: Noclip ON/OFF, Pitch LOCK/FREE.
 --
--- Optimizations vs previous build:
---  1. Noclip: single Stepped connection with 15 Hz throttle instead of 3 connections at 60 Hz.
---  2. Movement engines on Stepped (PreSimulation) so velocity applies before physics.
---  3. enforceNoclipSweep uses GetChildren BFS: skips non-container descendants, no pcall in hot-path.
---  4. pcall removed from CanCollide writes (part validated just before).
---  5. AlignPosition.Responsiveness lowered from 60 to 40 (less force calc per frame).
+-- AZERTY mapping (Roblox uses physical QWERTY positions):
+--   AZERTY M  -> Enum.KeyCode.Semicolon  (QWERTY ; position)  <-- engine switch
+--   AZERTY ^  -> Enum.KeyCode.LeftBracket (QWERTY [ position)
+--   AZERTY $  -> Enum.KeyCode.RightBracket (QWERTY ] position)
 --
--- AZERTY mapping:
---   AZERTY M  -> KeyCode.Semicolon  -> GetString returns "m"
---   AZERTY ^  -> KeyCode.LeftBracket -> GetString returns "^"
---   AZERTY $  -> KeyCode.RightBracket -> GetString returns "$"
+-- Fix vs previous build: isEngineKey no longer uses GetStringForKeyCode
+-- (unreliable on Xeno), it matches the physical KeyCode directly.
 
 if _G.azerty098890Loaded then return end
 _G.azerty098890Loaded = true
@@ -121,7 +117,6 @@ local function scanCharacterNoclip(char)
     end
 end
 
--- BFS over GetChildren, only descends into containers (skip Humanoid/Scripts/etc).
 local function enforceNoclipSweep()
     if not NOCLIP_ENABLED then return end
     local c = character
@@ -189,7 +184,6 @@ local function startNativeNoclip()
     hookCharacterNoclip(character)
     reaffirmOwnership()
 
-    -- Single Stepped connection, throttled internally. Watchdog at 4 Hz keeps full rescan.
     noclipSweepAccum = 0
     table.insert(noclipGlobalConns, RunService.Stepped:Connect(function(_, dt)
         if not NOCLIP_ENABLED then return end
@@ -582,7 +576,7 @@ local function getMoverParent()
     return rootPart
 end
 
---// Engine 1: LinearVelocity + AlignOrientation (Stepped)
+--// Engine 1: LinearVelocity + AlignOrientation
 local function startVelocityEngine(gen)
     local parent = getMoverParent()
     if not parent then return end
@@ -639,7 +633,7 @@ local function startVelocityEngine(gen)
     end)
 end
 
---// Engine 2: AlignPosition + AlignOrientation (Stepped)
+--// Engine 2: AlignPosition + AlignOrientation
 local function startAlignEngine(gen)
     local parent = getMoverParent()
     if not parent then return end
@@ -702,7 +696,7 @@ local function startAlignEngine(gen)
     end)
 end
 
---// Engine 3: BodyVelocity + BodyGyro (Stepped)
+--// Engine 3: BodyVelocity + BodyGyro
 local function startBodyEngine(gen)
     local parent = getMoverParent()
     if not parent then return end
@@ -753,7 +747,7 @@ local function startBodyEngine(gen)
     end)
 end
 
---// Engine 4: CFrame direct on Head (Stepped)
+--// Engine 4: CFrame direct on Head
 local function startCFrameEngine(gen)
     local head = character and character:FindFirstChild("Head")
     if not head then return end
@@ -894,10 +888,11 @@ local function isSpeedDown(kc)
     return ok and s == "$"
 end
 
--- Matches only keys producing "m". AZERTY M = Semicolon -> "m", AZERTY comma -> ",".
+-- FIX: engine key matched by physical KeyCode, no GetStringForKeyCode.
+-- AZERTY physical M = Enum.KeyCode.Semicolon (QWERTY ; position).
+-- QWERTY physical M = Enum.KeyCode.M.
 local function isEngineKey(kc)
-    local ok, s = pcall(function() return UserInputService:GetStringForKeyCode(kc) end)
-    return ok and s == "m"
+    return kc == Enum.KeyCode.Semicolon or kc == Enum.KeyCode.M
 end
 
 UserInputService.InputBegan:Connect(function(input, gpe)
