@@ -1,14 +1,15 @@
--- azerty098890 — fly + noclip (optimized, M fixed for AZERTY)
+-- azerty098890 — fly + noclip (optimized, all fixes applied)
 -- P = fly toggle. M (AZERTY physical M) = switch engine. ^ = +10, $ = -10.
 -- Ctrl+wheel = GUI scale. Toggles: Noclip ON/OFF, Pitch LOCK/FREE.
 --
--- AZERTY mapping (Roblox uses physical QWERTY positions):
---   AZERTY M  -> Enum.KeyCode.Semicolon  (QWERTY ; position)  <-- engine switch
---   AZERTY ^  -> Enum.KeyCode.LeftBracket (QWERTY [ position)
---   AZERTY $  -> Enum.KeyCode.RightBracket (QWERTY ] position)
---
--- Fix vs previous build: isEngineKey no longer uses GetStringForKeyCode
--- (unreliable on Xeno), it matches the physical KeyCode directly.
+-- Fixes in this build:
+--  [1] isEngineKey no longer fires on AZERTY ',' (only on physical M via string check).
+--  [2] SPEED_UP/DOWN lists: removed Six/Four (no more '-' and ''' bleed on AZERTY).
+--  [3] flyHumanoidDiedConn disconnected on close (no leak).
+--  [4] reaffirmOwnership skipped when Head is anchored (CFRAME mode is a no-op).
+--  [5] Noclip BFS now descends into Tool containers too.
+--  [6] startFlyInternal guards humanoid nil AND parent.
+--  [7] Engine key physical mapping: AZERTY M = Semicolon, QWERTY M = M.
 
 if _G.azerty098890Loaded then return end
 _G.azerty098890Loaded = true
@@ -45,8 +46,9 @@ local CONFIG = {
     ALIGN_RESPONSIVENESS = 40,
 }
 
-local SPEED_UP_KEYS   = {Enum.KeyCode.Six,  Enum.KeyCode.LeftBracket}
-local SPEED_DOWN_KEYS = {Enum.KeyCode.Four, Enum.KeyCode.RightBracket}
+-- [FIX 2] Six/Four removed: they bled on AZERTY ('-' and ''' keys).
+local SPEED_UP_KEYS   = {Enum.KeyCode.LeftBracket}
+local SPEED_DOWN_KEYS = {Enum.KeyCode.RightBracket}
 
 local ENGINES = {"VELOCITY", "ALIGN", "BODY", "CFRAME"}
 
@@ -85,7 +87,7 @@ end
 local function currentEngine() return ENGINES[engineIdx] end
 
 --// ============================================================
---// NOCLIP (optimized)
+--// NOCLIP
 --// ============================================================
 
 local function lockPart(part)
@@ -117,6 +119,7 @@ local function scanCharacterNoclip(char)
     end
 end
 
+-- [FIX 5] BFS descends into Tool containers too.
 local function enforceNoclipSweep()
     if not NOCLIP_ENABLED then return end
     local c = character
@@ -131,17 +134,21 @@ local function enforceNoclipSweep()
                 if child.CanCollide then
                     child.CanCollide = false
                 end
-            elseif child:IsA("Model") or child:IsA("Folder") or child:IsA("Accessory") then
+            elseif child:IsA("Model") or child:IsA("Folder")
+                or child:IsA("Accessory") or child:IsA("Tool") then
                 queue[#queue + 1] = child
             end
         end
     end
 end
 
+-- [FIX 4] skip when Head is anchored (CFRAME mode).
 local function reaffirmOwnership()
     if not (NOCLIP_ENABLED or FLYING) then return end
     local c = character
     if not c or not c.Parent then return end
+    local head = c:FindFirstChild("Head")
+    if head and head.Anchored then return end
     local rp = c:FindFirstChild("HumanoidRootPart")
     if rp and rp:IsA("BasePart") and not rp.Anchored then
         pcall(function() rp:SetNetworkOwner(player) end)
@@ -827,8 +834,9 @@ local function startFlyInternal(preserveToggle)
         return
     end
     if not character or not character.Parent then return end
-    if humanoid and humanoid.Health <= 0 then return end
-    if humanoid and not humanoid.Parent then return end
+    -- [FIX 6] humanoid nil OR detached
+    if not humanoid or not humanoid.Parent then return end
+    if humanoid.Health <= 0 then return end
     if not preserveToggle then isFlyToggledOn = true end
 
     FLYING = true
@@ -888,11 +896,18 @@ local function isSpeedDown(kc)
     return ok and s == "$"
 end
 
--- FIX: engine key matched by physical KeyCode, no GetStringForKeyCode.
--- AZERTY physical M = Enum.KeyCode.Semicolon (QWERTY ; position).
--- QWERTY physical M = Enum.KeyCode.M.
+-- [FIX 1] `,` (AZERTY) no longer fires engine switch.
+-- Semicolon = physical M on AZERTY -> always engine.
+-- M (QWERTY position) = either QWERTY M ("m") or AZERTY ',' (",").
+-- Only fires if GetString reports "m".
 local function isEngineKey(kc)
-    return kc == Enum.KeyCode.Semicolon or kc == Enum.KeyCode.M
+    if kc == Enum.KeyCode.Semicolon then return true end
+    if kc == Enum.KeyCode.M then
+        local ok, s = pcall(function() return UserInputService:GetStringForKeyCode(kc) end)
+        if not ok or s == nil then return true end
+        return s == "m"
+    end
+    return false
 end
 
 UserInputService.InputBegan:Connect(function(input, gpe)
@@ -954,6 +969,11 @@ end)
 
 closeButton.MouseButton1Click:Connect(function()
     stopFlyInternal(false)
+    -- [FIX 3] disconnect pending Died handler
+    if flyHumanoidDiedConn then
+        pcall(function() flyHumanoidDiedConn:Disconnect() end)
+        flyHumanoidDiedConn = nil
+    end
     destroyNoclip()
     _G.azerty098890Loaded = false
     screenGui:Destroy()
