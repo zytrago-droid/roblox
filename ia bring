@@ -1,15 +1,42 @@
--- Bring Panel + Follow + Bring All + Noclip (STRICT & MODERN UI)
--- B = panneau | N = stop | G = bring all | L = boucle | K = noclip | Ctrl+wheel = scale
+-- Bring Panel + Follow + Bring All + Noclip (STRICT & MODERN UI + RESIZABLE + SIGNATURE + SEARCH + SAVE SYSTEM)
+-- N = stop | G = bring all | L = boucle | K = noclip | Ctrl+wheel = scale
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local TweenService     = game:GetService("TweenService")
+local HttpService      = game:GetService("HttpService")
+
+--============================================================
+-- SYSTÈME DE SAUVEGARDE
+--============================================================
+local SAVE_FILE = "bring_config.json"
+local SaveData = {}
+
+local function loadSave()
+    if not readfile then return end
+    pcall(function()
+        if isfile and not isfile(SAVE_FILE) then return end
+        local raw = readfile(SAVE_FILE)
+        if type(raw) ~= "string" or raw == "" then return end
+        local decoded = HttpService:JSONDecode(raw)
+        if type(decoded) ~= "table" then return end
+        SaveData = decoded
+    end)
+end
+
+local function writeSave()
+    if not writefile then return end
+    pcall(function()
+        writefile(SAVE_FILE, HttpService:JSONEncode(SaveData))
+    end)
+end
+
+loadSave()
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
 local CONFIG = {
-    TOGGLE_KEY      = Enum.KeyCode.B,
     STOP_KEY        = Enum.KeyCode.N,
     BRING_ALL_KEY   = Enum.KeyCode.G,
     LOOP_KEY        = Enum.KeyCode.L,
@@ -17,10 +44,12 @@ local CONFIG = {
     MAX_DISTANCE    = math.huge,
     PANEL_WIDTH     = 300,
     PANEL_HEIGHT    = 440,
+    MIN_WIDTH       = 250,
+    MIN_HEIGHT      = 300,
     ROW_HEIGHT      = 50,
     THUMB_SIZE      = 36,
-    BEHIND_OFFSET   = 0.5,    -- Très collé
-    Y_OFFSET        = 1.5,    -- Évite le clip au sol
+    BEHIND_OFFSET   = 0.5,
+    Y_OFFSET        = 1.5,
     UI_SCALE_STEP   = 0.08,
     UI_SCALE_MIN    = 0.6,
     UI_SCALE_MAX    = 1.8,
@@ -31,7 +60,6 @@ local CONFIG = {
     FALLBACK_THUMB  = "https://www.roblox.com/headshot-thumbnail/image?userId=%d&width=420&height=420&format=png",
 }
 
--- Couleurs du thème
 local THEME = {
     BG        = Color3.fromRGB(24, 24, 27),
     HEADER    = Color3.fromRGB(18, 18, 20),
@@ -40,7 +68,7 @@ local THEME = {
     ROW_ACTIVE= Color3.fromRGB(40, 80, 50),
     TEXT      = Color3.fromRGB(230, 230, 230),
     SUBTEXT   = Color3.fromRGB(160, 160, 170),
-    ACCENT    = Color3.fromRGB(114, 137, 218), -- Bleu Discord
+    ACCENT    = Color3.fromRGB(114, 137, 218),
     DANGER    = Color3.fromRGB(237, 66, 69),
     SUCCESS   = Color3.fromRGB(87, 242, 135)
 }
@@ -50,15 +78,20 @@ local THEME = {
 --============================================================
 local thumbnailCache = {}
 local playerRows     = {}
-local panelVisible   = false
-local panelGui, mainFrame, listFrame, statusLabel, uiScale
+local panelVisible   = true
+local panelGui, mainFrame, listFrame, statusLabel, uiScale, searchBox
+local signatureGui
 local followTarget   = nil
 local lastFollowTick = 0
 local bringAllActive = false
 local bringAllLoop   = false
 local bringAllThread = nil
+
 local isDragging     = false
 local dragStart, startPos
+
+local isResizing     = false
+local resizeStart, startSizeX, startSizeY
 
 --============================================================
 -- NOCLIP
@@ -156,6 +189,9 @@ end
 
 local function toggleNoclip()
     if noclipEnabled then disableNoclip() else enableNoclip() end
+    -- NOTE: save noclip state
+    SaveData.noclipEnabled = noclipEnabled
+    writeSave()
 end
 
 LocalPlayer.CharacterAdded:Connect(function(newChar)
@@ -323,11 +359,26 @@ local function onRowClick(player, row)
     if bringAllActive then bringAllActive = false end
     if followTarget == player then stopFollow("Follow arrêté"); return end
     if startFollow(player) then
-        -- Flash effect
         row.BackgroundColor3 = THEME.ACCENT
         task.delay(0.15, function()
             if row and row.Parent then updateRowState(player, true) end
         end)
+    end
+end
+
+local function applyFilter()
+    if not searchBox or not listFrame then return end
+    local query = string.lower(searchBox.Text)
+    for player, row in pairs(playerRows) do
+        if row and row.Parent then
+            if query == "" then
+                row.Visible = true
+            else
+                local nameMatch = string.find(string.lower(player.Name), query, 1, true)
+                local displayMatch = string.find(string.lower(player.DisplayName), query, 1, true)
+                row.Visible = (nameMatch ~= nil) or (displayMatch ~= nil)
+            end
+        end
     end
 end
 
@@ -393,7 +444,6 @@ local function createRow(player)
     
     createHoverEffect(btn, THEME.ACCENT, THEME.ACCENT:Lerp(Color3.new(1,1,1), 0.2))
 
-    -- Click catcher
     local clickCatcher = Instance.new("TextButton")
     clickCatcher.Size = UDim2.new(1, 0, 1, 0)
     clickCatcher.BackgroundTransparency = 1
@@ -402,7 +452,6 @@ local function createRow(player)
     clickCatcher.ZIndex = 2
     clickCatcher.Parent = row
 
-    -- Hover sur la ligne
     clickCatcher.MouseEnter:Connect(function()
         if followTarget ~= player then
             TweenService:Create(row, TweenInfo.new(0.15), {BackgroundColor3 = THEME.ROW_HOVER}):Play()
@@ -423,6 +472,13 @@ local function createRow(player)
     clickCatcher.MouseButton1Click:Connect(function() onRowClick(player, row) end)
     
     playerRows[player] = row
+
+    if searchBox and searchBox.Text ~= "" then
+        local query = string.lower(searchBox.Text)
+        local nameMatch = string.find(string.lower(player.Name), query, 1, true)
+        local displayMatch = string.find(string.lower(player.DisplayName), query, 1, true)
+        row.Visible = (nameMatch ~= nil) or (displayMatch ~= nil)
+    end
 end
 
 local function removeRow(player)
@@ -517,13 +573,35 @@ local function buildUI()
     panelGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     panelGui.Parent = PlayerGui
 
+    signatureGui = Instance.new("ScreenGui")
+    signatureGui.Name = "SignatureGUI"
+    signatureGui.ResetOnSpawn = false
+    signatureGui.IgnoreGuiInset = true
+    signatureGui.Parent = PlayerGui
+
+    local signatureLabel = Instance.new("TextLabel")
+    signatureLabel.Size = UDim2.new(0, 320, 0, 32)
+    signatureLabel.AnchorPoint = Vector2.new(0, 1)
+    signatureLabel.Position = UDim2.new(0, 16, 1, -16)
+    signatureLabel.BackgroundTransparency = 1
+    signatureLabel.TextColor3 = Color3.fromRGB(0, 180, 255)
+    signatureLabel.Font = Enum.Font.GothamBold
+    signatureLabel.TextSize = 20
+    signatureLabel.TextXAlignment = Enum.TextXAlignment.Left
+    signatureLabel.TextYAlignment = Enum.TextYAlignment.Bottom
+    signatureLabel.TextStrokeTransparency = 0.4
+    signatureLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    signatureLabel.Text = "by azerty098890"
+    signatureLabel.Parent = signatureGui
+
     mainFrame = Instance.new("Frame")
     mainFrame.Name = "Main"
+    mainFrame.AnchorPoint = Vector2.new(1, 0.5)
     mainFrame.Size = UDim2.fromOffset(CONFIG.PANEL_WIDTH, CONFIG.PANEL_HEIGHT)
-    mainFrame.Position = UDim2.new(1, -CONFIG.PANEL_WIDTH - 20, 0.5, -CONFIG.PANEL_HEIGHT/2)
+    mainFrame.Position = UDim2.new(1, -20, 0.5, 0)
     mainFrame.BackgroundColor3 = THEME.BG
     mainFrame.BorderSizePixel = 0
-    mainFrame.Visible = false
+    mainFrame.Visible = true
     mainFrame.Active = true
     mainFrame.Parent = panelGui
     local mc = Instance.new("UICorner"); mc.CornerRadius = UDim.new(0, 10); mc.Parent = mainFrame
@@ -540,7 +618,6 @@ local function buildUI()
     header.BorderSizePixel = 0
     header.Parent = mainFrame
     local hc = Instance.new("UICorner"); hc.CornerRadius = UDim.new(0, 10); hc.Parent = header
-    -- Masquer les coins du bas du header
     local headerFix = Instance.new("Frame")
     headerFix.Size = UDim2.new(1, 0, 0, 10)
     headerFix.Position = UDim2.new(0, 0, 1, -10)
@@ -577,7 +654,17 @@ local function buildUI()
         end
     end)
     UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then isDragging = false end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then 
+            if isDragging then
+                -- NOTE: save panel position
+                SaveData.panelPosition = {
+                    sx = mainFrame.Position.X.Scale, ox = mainFrame.Position.X.Offset,
+                    sy = mainFrame.Position.Y.Scale, oy = mainFrame.Position.Y.Offset
+                }
+                writeSave()
+                isDragging = false 
+            end
+        end
     end)
 
     -- Close Button
@@ -599,6 +686,9 @@ local function buildUI()
         stopAll()
         panelVisible = false
         mainFrame.Visible = false
+        if signatureGui then
+            pcall(function() signatureGui:Destroy() end)
+        end
     end)
 
     -- CONTROLS BAR (Noclip, Loop, Bring All)
@@ -649,14 +739,36 @@ local function buildUI()
             TweenService:Create(loopBtn, TweenInfo.new(0.2), {BackgroundColor3 = THEME.ROW}):Play()
         end
         setStatus("Loop: " .. (bringAllLoop and "ON" or "OFF"), false)
+        -- NOTE: save loop state
+        SaveData.bringAllLoop = bringAllLoop
+        writeSave()
     end)
 
     noclipBtn.MouseButton1Click:Connect(toggleNoclip)
 
+    -- SEARCH BAR
+    searchBox = Instance.new("TextBox")
+    searchBox.Name = "SearchBox"
+    searchBox.Size = UDim2.new(1, -20, 0, 26)
+    searchBox.Position = UDim2.fromOffset(10, 84)
+    searchBox.BackgroundColor3 = THEME.ROW
+    searchBox.BorderSizePixel = 0
+    searchBox.Font = Enum.Font.Gotham
+    searchBox.TextSize = 12
+    searchBox.TextColor3 = THEME.TEXT
+    searchBox.PlaceholderText = "Rechercher un joueur..."
+    searchBox.PlaceholderColor3 = THEME.SUBTEXT
+    searchBox.Text = ""
+    searchBox.ClearTextOnFocus = false
+    searchBox.Parent = mainFrame
+    local sbc = Instance.new("UICorner"); sbc.CornerRadius = UDim.new(0, 6); sbc.Parent = searchBox
+    
+    searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter)
+
     -- LIST
     listFrame = Instance.new("ScrollingFrame")
-    listFrame.Size = UDim2.new(1, -16, 1, -130)
-    listFrame.Position = UDim2.fromOffset(8, 86)
+    listFrame.Size = UDim2.new(1, -16, 1, -160)
+    listFrame.Position = UDim2.fromOffset(8, 116)
     listFrame.BackgroundTransparency = 1
     listFrame.BorderSizePixel = 0
     listFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
@@ -685,17 +797,74 @@ local function buildUI()
     uiScale = Instance.new("UIScale")
     uiScale.Scale = 1
     uiScale.Parent = mainFrame
-end
 
-local function togglePanel()
-    if not mainFrame then return end
-    panelVisible = not panelVisible
-    if panelVisible then 
-        refreshList() 
-    else
-        stopAll()
+    -- RESIZE HANDLE
+    local resizeHandle = Instance.new("TextButton")
+    resizeHandle.Name = "ResizeHandle"
+    resizeHandle.Size = UDim2.new(0, 20, 0, 20)
+    resizeHandle.Position = UDim2.new(1, -20, 1, -20)
+    resizeHandle.BackgroundTransparency = 1
+    resizeHandle.Text = "◢"
+    resizeHandle.TextColor3 = THEME.SUBTEXT
+    resizeHandle.Font = Enum.Font.GothamBold
+    resizeHandle.TextSize = 14
+    resizeHandle.ZIndex = 10
+    resizeHandle.Parent = mainFrame
+    
+    resizeHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            isResizing = true
+            resizeStart = input.Position
+            startSizeX = mainFrame.Size.X.Offset
+            startSizeY = mainFrame.Size.Y.Offset
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if isResizing then
+                -- NOTE: save panel size
+                SaveData.panelSize = { ox = mainFrame.Size.X.Offset, oy = mainFrame.Size.Y.Offset }
+                writeSave()
+                isResizing = false
+            end
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if isResizing and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local delta = input.Position - resizeStart
+            local scale = uiScale.Scale or 1
+            local newWidth = math.max(CONFIG.MIN_WIDTH, startSizeX + (delta.X / scale))
+            local newHeight = math.max(CONFIG.MIN_HEIGHT, startSizeY + (delta.Y / scale))
+            mainFrame.Size = UDim2.fromOffset(newWidth, newHeight)
+        end
+    end)
+    resizeHandle.MouseEnter:Connect(function() resizeHandle.TextColor3 = THEME.TEXT end)
+    resizeHandle.MouseLeave:Connect(function() resizeHandle.TextColor3 = THEME.SUBTEXT end)
+
+    -- APPLY SAVE DATA
+    if SaveData.panelPosition then
+        mainFrame.Position = UDim2.new(
+            SaveData.panelPosition.sx or 1, SaveData.panelPosition.ox or -20,
+            SaveData.panelPosition.sy or 0.5, SaveData.panelPosition.oy or 0
+        )
     end
-    mainFrame.Visible = panelVisible
+    if SaveData.panelSize then
+        mainFrame.Size = UDim2.new(
+            0, math.max(CONFIG.MIN_WIDTH, SaveData.panelSize.ox or CONFIG.PANEL_WIDTH),
+            0, math.max(CONFIG.MIN_HEIGHT, SaveData.panelSize.oy or CONFIG.PANEL_HEIGHT)
+        )
+    end
+    if SaveData.uiScale then
+        uiScale.Scale = SaveData.uiScale
+    end
+    if SaveData.bringAllLoop then
+        bringAllLoop = true
+        loopBtn.TextColor3 = THEME.SUCCESS
+        loopBtn.BackgroundColor3 = Color3.fromRGB(30, 50, 35)
+    end
+    if SaveData.noclipEnabled then
+        enableNoclip() -- enableNoclip gère déjà la mise à jour visuelle du bouton noclip
+    end
 end
 
 --============================================================
@@ -706,8 +875,7 @@ Players.PlayerRemoving:Connect(function(p) removeRow(p) end)
 
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
-    if input.KeyCode == CONFIG.TOGGLE_KEY then togglePanel()
-    elseif input.KeyCode == CONFIG.STOP_KEY then
+    if input.KeyCode == CONFIG.STOP_KEY then
         if bringAllActive then bringAllActive = false end
         if followTarget then stopFollow("Follow arrêté") end
     elseif input.KeyCode == CONFIG.BRING_ALL_KEY then 
@@ -725,6 +893,9 @@ UserInputService.InputChanged:Connect(function(input, processed)
     if input.UserInputType == Enum.UserInputType.MouseWheel and uiScale then
         if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
             uiScale.Scale = math.clamp(uiScale.Scale + input.Position.Z * CONFIG.UI_SCALE_STEP, CONFIG.UI_SCALE_MIN, CONFIG.UI_SCALE_MAX)
+            -- NOTE: save ui scale
+            SaveData.uiScale = uiScale.Scale
+            writeSave()
         end
     end
 end)
@@ -740,4 +911,4 @@ if LocalPlayer.Character then
     local nchar = LocalPlayer.Character
     task.spawn(function() task.wait(0.1); if noclipEnabled then scanCharacter(nchar); enforceNoclip() end end)
 end
-print("[Bring] Modern UI Loaded. B=panel | G=all | L=loop | K=noclip | N=stop")
+print("[Bring] Modern UI Loaded + Resizable + Signature + Search + SaveSystem. G=all | L=loop | K=noclip | N=stop")
