@@ -3,6 +3,7 @@
 -- Aimbot | Xeno / AZERTY — maximum optimization
 -- Aim assist + FOV circle + GUI + close + rebind
 -- Toggle: F | M4/M5 | NPC | friend green / enemy red
+-- by azerty098890
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -73,15 +74,12 @@ local function isBindDown(b)
 end
 
 -- ============================================================
--- SAVE SYSTEM — panel size + position persisted to disk
+-- SAVE SYSTEM — Config + panel state persisted
 -- ============================================================
+local Config  -- forward decl (assigned below)
+
 local SAVE_FILE = "aimbot_config.json"
-local SaveData = {
-    panelW = nil,
-    panelH = nil,
-    panelX = nil,
-    panelY = nil,
-}
+local SaveData = {}
 
 local function loadSave()
     if not readfile then return end
@@ -91,26 +89,65 @@ local function loadSave()
         if type(raw) ~= "string" or raw == "" then return end
         local decoded = HttpService:JSONDecode(raw)
         if type(decoded) ~= "table" then return end
-        if type(decoded.panelW) == "number" then SaveData.panelW = decoded.panelW end
-        if type(decoded.panelH) == "number" then SaveData.panelH = decoded.panelH end
-        if type(decoded.panelX) == "number" then SaveData.panelX = decoded.panelX end
-        if type(decoded.panelY) == "number" then SaveData.panelY = decoded.panelY end
+        SaveData = decoded
     end)
 end
 
 local function writeSave()
-    if not writefile then return end
+    if not writefile or not Config then return end
+
+    SaveData.HoldToAim     = Config.HoldToAim
+    SaveData.TeamCheck     = Config.TeamCheck
+    SaveData.VisibleCheck  = Config.VisibleCheck
+    SaveData.UsePrediction = Config.UsePrediction
+    SaveData.TargetPlayers = Config.TargetPlayers
+    SaveData.TargetNPCs    = Config.TargetNPCs
+    SaveData.EnemyOnly     = Config.EnemyOnly
+
+    SaveData.FOVRadius       = Config.FOVRadius
+    SaveData.Smoothing       = Config.Smoothing
+    SaveData.Prediction      = Config.Prediction
+    SaveData.HRPJitterRadius = Config.HRPJitterRadius
+
+    SaveData.TargetPart = Config.TargetPart
+    SaveData.TargetMode = Config.TargetMode
+
+    SaveData.CircleColor = string.format("%d,%d,%d",
+        math.floor(Config.CircleColor.R * 255 + 0.5),
+        math.floor(Config.CircleColor.G * 255 + 0.5),
+        math.floor(Config.CircleColor.B * 255 + 0.5))
+
+    if Config.AimbotBind.kind == "key" then
+        SaveData.AimbotBindKind  = "key"
+        SaveData.AimbotBindName  = Config.AimbotBind.code.Name
+        SaveData.AimbotBindIndex = nil
+    else
+        SaveData.AimbotBindKind  = "mouse"
+        SaveData.AimbotBindName  = nil
+        SaveData.AimbotBindIndex = Config.AimbotBind.index
+    end
+
     pcall(function()
         writefile(SAVE_FILE, HttpService:JSONEncode(SaveData))
+    end)
+end
+
+local saveQueued = false
+local function saveSoon()
+    if saveQueued then return end
+    saveQueued = true
+    task.defer(function()
+        saveQueued = false
+        writeSave()
     end)
 end
 
 loadSave()
 
 -- ============================================================
--- CONFIG
+-- CONFIG (defaults then overwritten by saved values)
 -- ============================================================
-local Config = {
+Config = {
     Enabled      = false,
     Held         = false,
     HoldToAim    = false,
@@ -130,6 +167,49 @@ local Config = {
     CircleColor  = Color3.fromRGB(0, 200, 255),
     AimbotBind   = keyBind(Enum.KeyCode.F),
 }
+
+-- apply saved values on top of defaults
+if type(SaveData.HoldToAim) == "boolean"     then Config.HoldToAim = SaveData.HoldToAim end
+if type(SaveData.TeamCheck) == "boolean"     then Config.TeamCheck = SaveData.TeamCheck end
+if type(SaveData.VisibleCheck) == "boolean"  then Config.VisibleCheck = SaveData.VisibleCheck end
+if type(SaveData.UsePrediction) == "boolean" then Config.UsePrediction = SaveData.UsePrediction end
+if type(SaveData.TargetPlayers) == "boolean" then Config.TargetPlayers = SaveData.TargetPlayers end
+if type(SaveData.TargetNPCs) == "boolean"    then Config.TargetNPCs = SaveData.TargetNPCs end
+if type(SaveData.EnemyOnly) == "boolean"     then Config.EnemyOnly = SaveData.EnemyOnly end
+
+if type(SaveData.FOVRadius) == "number"       then Config.FOVRadius = math_clamp(SaveData.FOVRadius, 50, 500) end
+if type(SaveData.Smoothing) == "number"       then Config.Smoothing = math_clamp(SaveData.Smoothing, 0.01, 1) end
+if type(SaveData.Prediction) == "number"      then Config.Prediction = math_clamp(SaveData.Prediction, 0, 0.5) end
+if type(SaveData.HRPJitterRadius) == "number" then Config.HRPJitterRadius = math_clamp(SaveData.HRPJitterRadius, 0, 2) end
+
+if type(SaveData.TargetPart) == "string"
+    and (SaveData.TargetPart == "Head"
+        or SaveData.TargetPart == "HumanoidRootPart"
+        or SaveData.TargetPart == "UpperTorso") then
+    Config.TargetPart = SaveData.TargetPart
+end
+if type(SaveData.TargetMode) == "string"
+    and (SaveData.TargetMode == "Mouse" or SaveData.TargetMode == "Center") then
+    Config.TargetMode = SaveData.TargetMode
+end
+
+if type(SaveData.CircleColor) == "string" then
+    local r, g, b = SaveData.CircleColor:match("^(%d+),(%d+),(%d+)$")
+    if r then
+        Config.CircleColor = Color3.fromRGB(
+            math_clamp(tonumber(r) or 0, 0, 255),
+            math_clamp(tonumber(g) or 0, 0, 255),
+            math_clamp(tonumber(b) or 0, 0, 255))
+    end
+end
+
+if SaveData.AimbotBindKind == "key" and type(SaveData.AimbotBindName) == "string" then
+    local ok, code = pcall(function() return Enum.KeyCode[SaveData.AimbotBindName] end)
+    if ok and code then Config.AimbotBind = keyBind(code) end
+elseif SaveData.AimbotBindKind == "mouse" and type(SaveData.AimbotBindIndex) == "number" then
+    local idx = math.floor(SaveData.AimbotBindIndex)
+    if idx >= 1 and idx <= 5 then Config.AimbotBind = mouseBind(idx) end
+end
 
 local reservedKeys = {
     [Enum.KeyCode.P]            = true,
@@ -239,6 +319,7 @@ local currentTarget
 
 local function cleanup()
     if closed then return end
+    if writeSave then pcall(writeSave) end
     closed = true
 
     if renderConn then pcall(function() renderConn:Disconnect() end); renderConn = nil end
@@ -618,12 +699,14 @@ track(UserInputService.InputBegan:Connect(function(input, gp)
             elseif input.KeyCode ~= Enum.KeyCode.Unknown and not reservedKeys[input.KeyCode] then
                 Config[rebinding] = keyBind(input.KeyCode)
                 rebinding = nil
+                saveSoon()
             end
             return
         end
         if rawIdx and rawIdx >= 1 then
             Config[rebinding] = mouseBind(rawIdx)
             rebinding = nil
+            saveSoon()
             return
         end
         return
@@ -811,10 +894,9 @@ local function buildGui()
     local PANEL_MIN_W = 240
     local PANEL_MIN_H = 320
 
-    -- default panel size / position, overridden by saved values if present
     local defW = 290
     local defH = vpY - 120
-    local defX = -20   -- offset relative to right anchor
+    local defX = -20
     local defY = 60
 
     local startW = SaveData.panelW or defW
@@ -933,9 +1015,7 @@ local function buildGui()
     list.Padding = UDim.new(0, 6)
     list.SortOrder = Enum.SortOrder.LayoutOrder
 
-    -- =========================================================
-    -- signature at bottom-left of the screen
-    -- =========================================================
+    -- signature bottom-left of screen
     local sigLabel = Instance.new("TextLabel")
     sigLabel.AnchorPoint = Vector2.new(0, 1)
     sigLabel.Position = UDim2.new(0, 16, 1, -16)
@@ -951,9 +1031,7 @@ local function buildGui()
     sigLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
     sigLabel.Parent = gui
 
-    -- =========================================================
-    -- resize grip (bottom-left of panel)
-    -- =========================================================
+    -- resize grip
     local resizeGrip = Instance.new("TextButton")
     resizeGrip.AnchorPoint = Vector2.new(0, 1)
     resizeGrip.Size = UDim2.new(0, 16, 0, 16)
@@ -1009,7 +1087,7 @@ local function buildGui()
             if resizing then
                 SaveData.panelW = panel.Size.X.Offset
                 SaveData.panelH = panel.Size.Y.Offset
-                writeSave()
+                saveSoon()
             end
             resizing = false
         end
@@ -1169,6 +1247,7 @@ local function buildGui()
             if disabledBy and disabledBy() then return end
             Config[key] = not Config[key]
             render(true)
+            saveSoon()
         end))
     end
 
@@ -1266,6 +1345,7 @@ local function buildGui()
         end))
         track(UserInputService.InputEnded:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                if dragging then saveSoon() end
                 dragging = false
             end
         end))
@@ -1325,6 +1405,7 @@ local function buildGui()
         track(btn.MouseButton1Click:Connect(function()
             cycle()
             val.Text = get()
+            saveSoon()
         end))
     end
 
@@ -1763,7 +1844,7 @@ local function buildGui()
             if dragging then
                 SaveData.panelX = panel.Position.X.Offset
                 SaveData.panelY = panel.Position.Y.Offset
-                writeSave()
+                saveSoon()
             end
             dragging = false
         end
