@@ -1,0 +1,442 @@
+-- --!native
+-- (décommenter UNIQUEMENT si l'executor supporte. si crash au load, garder commenté.)
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+
+if not Players.LocalPlayer then
+    repeat task.wait(0.1) until Players.LocalPlayer
+end
+if not workspace.CurrentCamera then
+    repeat task.wait(0.1) until workspace.CurrentCamera
+end
+if not Drawing or not Drawing.new then
+    warn("[ESP] Drawing API unavailable on this executor. Aborting.")
+    return
+end
+
+local LP  = Players.LocalPlayer
+local Cam = workspace.CurrentCamera
+
+local V2, V3       = Vector2.new, Vector3.new
+local C3RGB        = Color3.fromRGB
+local max          = math.max
+local sqrt         = math.sqrt
+local clock        = os.clock
+
+-- =========================================================
+-- CONFIG
+-- =========================================================
+local DEFAULT_COL = C3RGB(255, 255, 255)
+local HP_HIGH     = C3RGB(0, 255, 120)
+local HP_MED      = C3RGB(255, 200, 50)
+local HP_LOW      = C3RGB(255, 60, 60)
+local TOOL_COL    = C3RGB(255, 220, 150)
+local BG_COL      = C3RGB(0, 0, 0)
+local OUTLINE_COL = C3RGB(0, 0, 0)
+
+local FONT_SIZE   = 13
+local LINE_H      = 15
+local PAD         = 3
+local T_TEXT      = 0.15
+local MARGIN      = 200
+local MAX_DIST_SQ = 5000 * 5000 -- Augmenté pour voir plus loin
+
+local ENABLED    = true
+local SHUTDOWN   = false
+local TOGGLE_KEY = Enum.KeyCode.RightShift
+local CLOSE_KEY  = Enum.KeyCode.End
+
+-- =========================================================
+-- PROFILE & CONNECTIONS
+-- =========================================================
+local profileBegin = (debug and debug.profilebegin) or function() end
+local profileEnd   = (debug and debug.profileend)   or function() end
+
+local Connections = {}
+local function track(c) Connections[#Connections+1] = c; return c end
+
+-- =========================================================
+-- DISTANCE CACHE
+-- =========================================================
+local DIST_CACHE = {}
+for i = 0, 300 do DIST_CACHE[i] = i .. "m" end
+local function distStr(d)
+    local i = d // 1
+    local s = DIST_CACHE[i]
+    if not s then
+        s = i .. "m"
+        if i < 5000 then DIST_CACHE[i] = s end
+    end
+    return s
+end
+
+-- =========================================================
+-- COULEUR TEAM
+-- =========================================================
+local function hashToColor(str)
+    local h = 0
+    for i = 1, #str do h = (h * 31 + str:byte(i)) % 16777216 end
+    local r = h // 65536 % 256
+    local g = h // 256 % 256
+    local b = h % 256
+    if r + g + b < 300 then
+        r = (r + 100 > 255) and 255 or r + 100
+        g = (g + 100 > 255) and 255 or g + 100
+        b = (b + 100 > 255) and 255 or b + 100
+    end
+    return C3RGB(r, g, b)
+end
+
+local TEAM_ATTRS    = {"Team", "Job", "Role", "Class"}
+local TEAM_CHILDREN = {"Team", "Job", "Role", "Class", "Occupation"}
+
+local function resolveTeam(plr)
+    local t = plr.Team
+    if t then
+        local tc = plr.TeamColor
+        return t.Name, tc and tc.Color or hashToColor(t.Name)
+    end
+    for _, attrName in ipairs(TEAM_ATTRS) do
+        local ok, v = pcall(function() return plr:GetAttribute(attrName) end)
+        if ok and v ~= nil then
+            local s = tostring(v)
+            return s, hashToColor(s)
+        end
+    end
+    for _, childName in ipairs(TEAM_CHILDREN) do
+        local obj = plr:FindFirstChild(childName)
+        if obj and obj:IsA("StringValue") and obj.Value ~= "" then
+            return obj.Value, hashToColor(obj.Value)
+        end
+        if plr.Character then
+            local obj2 = plr.Character:FindFirstChild(childName)
+            if obj2 and obj2:IsA("StringValue") and obj2.Value ~= "" then
+                return obj2.Value, hashToColor(obj2.Value)
+            end
+        end
+    end
+    return nil, nil
+end
+
+-- =========================================================
+-- BUILD DRAWING OBJECTS
+-- =========================================================
+local BUILD_FAILED = false
+local function newDraw(cls)
+    local ok, o = pcall(Drawing.new, cls)
+    return ok and o or nil
+end
+
+local function buildObjs()
+    if BUILD_FAILED then return nil end
+    local bg = newDraw("Square")
+    local l1 = newDraw("Text")
+    local l2 = newDraw("Text")
+    local l3 = newDraw("Text")
+    if not (bg and l1 and l2 and l3) then BUILD_FAILED = true; return nil end
+    bg.Filled = true; bg.Color = BG_COL; bg.Transparency = 0.5; bg.Visible = false
+    for _, t in ipairs({l1, l2, l3}) do
+        t.Center = true; t.Outline = true; t.OutlineColor = OUTLINE_COL
+        t.Size = FONT_SIZE; t.Visible = false
+    end
+    pcall(function()
+        if Drawing.Fonts then
+            local f = Drawing.Fonts.Plex or Drawing.Fonts.System
+            if f then l1.Font = f; l2.Font = f; l3.Font = f end
+        end
+    end)
+    return {
+        bg=bg, l1=l1, l2=l2, l3=l3,
+        char=nil, head=nil, hrp=nil, hum=nil, isMockHum=false,
+        teamName=nil, teamCol=nil, lastTeam=nil,
+        tText=0, lastTool=nil, bw=nil, blockH=0,
+    }
+end
+
+local function resetObj(o)
+    o.char=nil; o.head=nil; o.hrp=nil; o.hum=nil; o.isMockHum=false
+    o.teamName=nil; o.teamCol=nil; o.lastTeam=nil
+    o.tText=0; o.lastTool=nil; o.bw=nil; o.blockH=0
+    o.bg.Visible=false; o.l1.Visible=false; o.l2.Visible=false; o.l3.Visible=false
+end
+
+local function removeObj(o)
+    pcall(function() o.bg:Remove() end)
+    pcall(function() o.l1:Remove() end)
+    pcall(function() o.l2:Remove() end)
+    pcall(function() o.l3:Remove() end)
+end
+
+local cache, freePool = {}, {}
+
+local function getObjs(plr)
+    local o = cache[plr]
+    if o then return o end
+    local n = #freePool
+    if n > 0 then
+        o = freePool[n]; freePool[n] = nil; resetObj(o)
+    else
+        o = buildObjs()
+    end
+    if o then cache[plr] = o end
+    return o
+end
+
+-- =========================================================
+-- TEXT WIDTH
+-- =========================================================
+local TEXT_BOUNDS_OK = nil
+local function textWidth(t, fallback)
+    if not t then return fallback end
+    if TEXT_BOUNDS_OK == false then return fallback end
+    if TEXT_BOUNDS_OK == nil then
+        local ok, tb = pcall(function() return t.TextBounds end)
+        if ok and tb and tb.X and tb.X > 0 then
+            TEXT_BOUNDS_OK = true; return tb.X
+        end
+        TEXT_BOUNDS_OK = false; return fallback
+    end
+    local tb = t.TextBounds
+    if tb and tb.X and tb.X > 0 then return tb.X end
+    return fallback
+end
+
+-- =========================================================
+-- RESOLVE CHARACTER (FIX GMOD)
+-- =========================================================
+local function resolveChar(plr, o)
+    local char = plr.Character
+    if o.head and o.head.Parent == char and char then return true end
+    o.char = char
+    if not char then
+        o.head=nil; o.hrp=nil; o.hum=nil; o.isMockHum=false
+        return false
+    end
+    
+    -- 1. Chercher le Humanoid
+    o.hum = char:FindFirstChildOfClass("Humanoid")
+    
+    -- 2. Chercher une partie "ancre" (HRP ou Torso)
+    o.hrp = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+    
+    -- 3. Chercher la "tête" ou la partie la plus haute (pour les props)
+    o.head = char:FindFirstChild("Head")
+    if not o.head then
+        local highestY = -math.huge
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") and part.Name ~= "Handle" then
+                if part.Position.Y > highestY then
+                    highestY = part.Position.Y
+                    o.head = part
+                end
+            end
+        end
+    end
+
+    -- 4. Si pas de Humanoid (ex: prop), on simule une santé de 100 pour l'affichage
+    if not o.hum then
+        o.hum = {Health = 100, MaxHealth = 100}
+        o.isMockHum = true
+    else
+        o.isMockHum = false
+    end
+
+    return o.head ~= nil and o.hrp ~= nil
+end
+
+local function hideAll(o)
+    o.bg.Visible = false
+    o.l1.Visible = false
+    o.l2.Visible = false
+    o.l3.Visible = false
+end
+
+-- =========================================================
+-- RENDER ONE
+-- =========================================================
+local function renderOne(plr, vp, camPos, now)
+    local o = getObjs(plr)
+    if not o then return end
+    if not resolveChar(plr, o) then hideAll(o); return end
+    
+    -- Si la cible est morte (vrai Humanoid), on cache
+    if not o.isMockHum and o.hum.Health <= 0 then hideAll(o); return end
+
+    local delta = o.hrp.Position - camPos
+    local distSq = delta.X*delta.X + delta.Y*delta.Y + delta.Z*delta.Z
+    if distSq > MAX_DIST_SQ then hideAll(o); return end
+
+    -- On prend la position de la "tête" ou du prop le plus haut
+    local p3 = Cam:WorldToViewportPoint(o.head.Position + V3(0, 3, 0))
+    if p3.Z <= 0 then hideAll(o); return end
+    if p3.X < -MARGIN or p3.X > vp.X + MARGIN
+    or p3.Y < -MARGIN or p3.Y > vp.Y + MARGIN then
+        hideAll(o); return
+    end
+
+    if now >= o.tText then
+        o.tText = now + T_TEXT
+
+        if o.lastTeam ~= plr.Team or o.teamCol == nil then
+            o.lastTeam = plr.Team
+            o.teamName, o.teamCol = resolveTeam(plr)
+        end
+
+        local tool = o.char:FindFirstChildOfClass("Tool")
+        o.lastTool = tool and tool.Name or nil
+
+        local teamCol  = o.teamCol or DEFAULT_COL
+        local teamName = o.teamName
+        o.l1.Text  = teamName and ("[" .. teamName .. "] " .. plr.Name) or plr.Name
+        o.l1.Color = teamCol
+
+        if o.lastTool then
+            o.l2.Text  = o.lastTool
+            o.l2.Color = TOOL_COL
+        end
+
+        local pct = o.hum.Health / o.hum.MaxHealth
+        local hpCol = pct > 0.5 and HP_HIGH or pct > 0.25 and HP_MED or HP_LOW
+        
+        if o.isMockHum then
+            -- Affichage spécial pour les props
+            o.l3.Text = "PROP  ·  " .. distStr(sqrt(distSq))
+            o.l3.Color = C3RGB(200, 200, 200)
+        else
+            o.l3.Text = (o.hum.Health // 1) .. " HP  ·  " .. distStr(sqrt(distSq))
+            o.l3.Color = hpCol
+        end
+
+        local w1 = textWidth(o.l1, #o.l1.Text * 8)
+        local w3 = textWidth(o.l3, #o.l3.Text * 8)
+        local bw = max(w1, w3)
+        if o.lastTool then bw = max(bw, textWidth(o.l2, #o.lastTool * 8)) end
+        o.bw = bw + 10
+
+        local hasTool = o.lastTool ~= nil
+        o.blockH = PAD * 2 + (2 + (hasTool and 1 or 0)) * LINE_H
+    end
+
+    local x = p3.X
+    local y = p3.Y - o.blockH - 6
+    local hasTool = o.lastTool ~= nil
+
+    o.l1.Position = V2(x, y + PAD); o.l1.Visible = true
+
+    local ny = y + PAD + LINE_H
+    if hasTool then
+        o.l2.Position = V2(x, ny); o.l2.Visible = true
+        ny = ny + LINE_H
+    else
+        o.l2.Visible = false
+    end
+    o.l3.Position = V2(x, ny); o.l3.Visible = true
+
+    o.bg.Size     = V2(o.bw, o.blockH)
+    o.bg.Position = V2(x - o.bw / 2, y)
+    o.bg.Visible  = true
+end
+
+-- =========================================================
+-- PLAYER LIST
+-- =========================================================
+local playerList = table.create(30)
+local function rebuildPlayerList()
+    table.clear(playerList)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then playerList[#playerList+1] = plr end
+    end
+end
+
+-- =========================================================
+-- SHUTDOWN
+-- =========================================================
+local function shutdown()
+    SHUTDOWN = true
+    ENABLED  = false
+    for _, o in pairs(cache) do removeObj(o) end
+    cache = {}
+    for _, o in ipairs(freePool) do removeObj(o) end
+    freePool = {}
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+    Connections = {}
+    print("[ESP] Shutdown.")
+end
+
+-- =========================================================
+-- MAIN LOOP
+-- =========================================================
+local RENDER_ERR_LOGGED = false
+
+track(RunService.Heartbeat:Connect(function()
+    if SHUTDOWN or not ENABLED then
+        if not SHUTDOWN then for _, o in pairs(cache) do hideAll(o) end end
+        return
+    end
+    
+    if not Cam then
+        Cam = workspace.CurrentCamera
+        if not Cam then return end
+    end
+
+    local now    = clock()
+    local camPos = Cam.CFrame.Position
+    local vp     = Cam.ViewportSize
+
+    profileBegin("ESP_Render")
+    
+    local ok, err = pcall(function()
+        for i = 1, #playerList do
+            local plr = playerList[i]
+            if plr and plr.Parent then
+                renderOne(plr, vp, camPos, now)
+            end
+        end
+    end)
+    
+    profileEnd()
+
+    if not ok and not RENDER_ERR_LOGGED then
+        RENDER_ERR_LOGGED = true
+        warn("[ESP] render error: " .. tostring(err))
+    end
+end))
+
+-- =========================================================
+-- LIFECYCLE
+-- =========================================================
+track(Players.PlayerAdded:Connect(rebuildPlayerList))
+track(Players.PlayerRemoving:Connect(function(plr)
+    rebuildPlayerList()
+    local o = cache[plr]
+    if o then
+        hideAll(o)
+        cache[plr] = nil
+        freePool[#freePool+1] = o
+    end
+end))
+rebuildPlayerList()
+
+track(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    if workspace.CurrentCamera then Cam = workspace.CurrentCamera end
+end))
+
+-- =========================================================
+-- INPUT
+-- =========================================================
+track(UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if SHUTDOWN then return end
+    if input.KeyCode == TOGGLE_KEY then
+        ENABLED = not ENABLED
+        if not ENABLED then for _, o in pairs(cache) do hideAll(o) end end
+        print("[ESP] " .. (ENABLED and "ON" or "OFF"))
+    elseif input.KeyCode == CLOSE_KEY then
+        shutdown()
+    end
+end))
+
+print("[ESP] Loaded. RightShift = toggle, End = shutdown.")
+print("[ESP] Tracking", #playerList, "players.")
