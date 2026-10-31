@@ -30,7 +30,6 @@ local typeof_          = typeof
 
 local LocalPlayer = Players.LocalPlayer
 
--- cache camera reference once, update on CurrentCamera change
 local cachedCamera = workspace.CurrentCamera
 workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
     cachedCamera = workspace.CurrentCamera
@@ -150,6 +149,51 @@ end
 loadPrefs()
 
 -- ============================================================
+-- TEAM WHITELIST
+-- ============================================================
+local TEAMS_FILE = "aimbot_teams.json"
+local SelectedTeams = {}
+local teamFilterActive = false
+
+local function teamKeyOf(plr)
+    local t = plr.Team
+    return t and t.Name or "__none"
+end
+
+local function recalcTeamFilter()
+    teamFilterActive = next(SelectedTeams) ~= nil
+end
+
+local function loadTeams()
+    if not readfile then return end
+    local ok = pcall(function()
+        if isfile and not isfile(TEAMS_FILE) then return end
+        local raw = readfile(TEAMS_FILE)
+        if type(raw) ~= "string" or raw == "" then return end
+        local decoded = HttpService:JSONDecode(raw)
+        if type(decoded) == "table" then
+            SelectedTeams = {}
+            for k, v in pairs(decoded) do
+                if type(k) == "string" and v == true then
+                    SelectedTeams[k] = true
+                end
+            end
+        end
+    end)
+    if not ok then SelectedTeams = {} end
+    recalcTeamFilter()
+end
+
+local function saveTeams()
+    if not writefile then return end
+    pcall(function()
+        writefile(TEAMS_FILE, HttpService:JSONEncode(SelectedTeams))
+    end)
+end
+
+loadTeams()
+
+-- ============================================================
 -- LIFECYCLE
 -- ============================================================
 local Connections     = {}
@@ -212,6 +256,7 @@ local function cleanup()
     if candidateOwner then table_clear(candidateOwner) end
     if partCache      then table_clear(partCache)      end
     if hrpJitters     then table_clear(hrpJitters)     end
+    if SelectedTeams  then table_clear(SelectedTeams)  end
 
     print("[Aimbot] Closed.")
 end
@@ -329,9 +374,6 @@ local function resolvePart(character)
     return p
 end
 
--- WorldToViewportPoint without the pcall: cachedCamera is guaranteed
--- non-nil before findTarget runs, and the method does not throw on a
--- valid camera. removing pcall removes a function-call wrapper per target.
 local function toScreen(worldPos)
     local cam = cachedCamera
     if not cam then return nil, false end
@@ -339,8 +381,6 @@ local function toScreen(worldPos)
     return sp, onScreen
 end
 
--- RaycastParams reused; the filter list is only rewritten when the
--- local character changes (CharacterAdded), not on every LOS check.
 local rayParams = RaycastParams.new()
 local rayFilterList = { LocalPlayer.Character }
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -384,11 +424,7 @@ local function getHRPJitter(part)
     return c.offset
 end
 
--- result table is reused, no allocation per frame
 local bestHit = { model = nil, part = nil, worldPos = nil, sx = 0, sy = 0 }
-
--- MAX_STUDS: cheap 3D distance pre-filter before the expensive projection.
--- targets beyond this range cannot reasonably be on-screen.
 local MAX_STUDS_SQ = 2000 * 2000
 
 local function findTarget()
@@ -428,6 +464,12 @@ local function findTarget()
             if not skip then
                 local owner = candidateOwner[model]
 
+                if teamFilterActive and owner then
+                    local tt = candidateTeam[model]
+                    local key = tt and tt.Name or "__none"
+                    if not SelectedTeams[key] then skip = true end
+                end
+
                 if not Config.TargetPlayers and owner then
                     skip = true
                 elseif not Config.TargetNPCs and not owner then
@@ -459,7 +501,6 @@ local function findTarget()
                         pos = pos + getHRPJitter(part)
                     end
 
-                    -- cheap 3D distance gate before the projection
                     local d3 = pos - camPos
                     if d3:Dot(d3) < MAX_STUDS_SQ then
                         local sp, onScreen = toScreen(pos)
@@ -518,7 +559,7 @@ local function levenshtein(a, b)
 end
 
 -- ============================================================
--- SILENT AIM — no table.pack, direct argument capture
+-- SILENT AIM
 -- ============================================================
 local silentHookInstalled = false
 local hookHead
@@ -541,7 +582,6 @@ local function installSilentHook()
                 local method = getname(originalNamecall, ...)
                 local cam = cachedCamera
                 if method == "Raycast" then
-                    -- capture first three args without allocating a packed table
                     local a1, a2, a3 = ...
                     if typeof_(a1) == "Vector3" then
                         local nearCam  = (a1 - cam.CFrame.Position).Magnitude < 20
@@ -670,17 +710,19 @@ for _, plr in ipairs(Players:GetPlayers()) do
     if plr ~= LocalPlayer then
         track(plr.CharacterAdded:Connect(markDirty))
         track(plr.CharacterRemoving:Connect(markDirty))
+        track(plr:GetPropertyChangedSignal("Team"):Connect(markDirty))
     end
 end
 track(Players.PlayerAdded:Connect(function(plr)
     track(plr.CharacterAdded:Connect(markDirty))
     track(plr.CharacterRemoving:Connect(markDirty))
+    track(plr:GetPropertyChangedSignal("Team"):Connect(markDirty))
     markDirty()
 end))
 track(Players.PlayerRemoving:Connect(markDirty))
 
 -- ============================================================
--- SCAN LOOP — 30 Hz, findTarget runs here, not in RenderStepped
+-- SCAN LOOP — 30 Hz
 -- ============================================================
 scanConn = task_spawn(function()
     local sweepTick = 0
@@ -808,9 +850,10 @@ local function buildGui()
     gui.Parent = parent
     guiRef = gui
 
+    -- Fixed-height panel: fills viewport with 60px margin top and bottom.
+    -- Title bar + divider stay pinned; the content below scrolls.
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.new(0, 290, 0, 0)
-    panel.AutomaticSize = Enum.AutomaticSize.Y
+    panel.Size = UDim2.new(0, 290, 1, -120)
     panel.AnchorPoint = Vector2.new(1, 0)
     panel.Position = UDim2.new(1, -20, 0, 60)
     panel.BackgroundColor3 = Colors.Body
@@ -893,16 +936,25 @@ local function buildGui()
     divider.BorderSizePixel = 0
     divider.Parent = panel
 
-    local content = Instance.new("Frame")
-    content.Size = UDim2.new(1, 0, 0, 0)
-    content.AutomaticSize = Enum.AutomaticSize.Y
+    -- Scrolling content area with automatic canvas sizing
+    local content = Instance.new("ScrollingFrame")
+    content.Size = UDim2.new(1, 0, 1, -47)
     content.Position = UDim2.new(0, 0, 0, 47)
     content.BackgroundTransparency = 1
+    content.BorderSizePixel = 0
+    content.CanvasSize = UDim2.new(0, 0, 0, 0)
+    content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    content.ScrollingDirection = Enum.ScrollingDirection.Y
+    content.ScrollBarThickness = 4
+    content.ScrollBarImageColor3 = Colors.Accent
+    content.ScrollBarImageTransparency = 0.3
+    content.ClipsDescendants = true
     content.Parent = panel
 
     local pad = Instance.new("UIPadding", content)
     pad.PaddingLeft = UDim.new(0, 12)
-    pad.PaddingRight = UDim.new(0, 12)
+    pad.PaddingRight = UDim.new(0, 16)
+    pad.PaddingTop = UDim.new(0, 6)
     pad.PaddingBottom = UDim.new(0, 14)
 
     local list = Instance.new("UIListLayout", content)
@@ -1222,6 +1274,169 @@ local function buildGui()
         end))
     end
 
+    -- =========================================================
+    -- teams whitelist
+    -- =========================================================
+    local function makeTeamsSection(order)
+        local container = Instance.new("Frame")
+        container.Size = UDim2.new(1, 0, 0, 150)
+        container.BackgroundColor3 = Colors.Surface
+        container.BackgroundTransparency = 0.4
+        container.BorderSizePixel = 0
+        container.LayoutOrder = order
+        container.ClipsDescendants = true
+        container.Parent = content
+        Instance.new("UICorner", container).CornerRadius = UDim.new(0, 6)
+
+        local scroll = Instance.new("ScrollingFrame")
+        scroll.Size = UDim2.new(1, 0, 1, 0)
+        scroll.BackgroundTransparency = 1
+        scroll.BorderSizePixel = 0
+        scroll.ScrollBarThickness = 3
+        scroll.ScrollBarImageColor3 = Colors.Accent
+        scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+        scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+        scroll.Parent = container
+
+        local padding = Instance.new("UIPadding", scroll)
+        padding.PaddingLeft = UDim.new(0, 5)
+        padding.PaddingRight = UDim.new(0, 5)
+        padding.PaddingTop = UDim.new(0, 5)
+        padding.PaddingBottom = UDim.new(0, 5)
+
+        local layout = Instance.new("UIListLayout", scroll)
+        layout.Padding = UDim.new(0, 4)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+        local rows = {}
+
+        local function collectTeams()
+            local set = {}
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LocalPlayer then
+                    set[teamKeyOf(plr)] = true
+                end
+            end
+            local arr = {}
+            for k in pairs(set) do arr[#arr + 1] = k end
+            table_sort(arr)
+            return arr
+        end
+
+        local function rebuild()
+            for _, r in ipairs(rows) do
+                pcall(function() r:Destroy() end)
+            end
+            rows = {}
+
+            local teams = collectTeams()
+            if #teams == 0 then
+                local empty = Instance.new("TextLabel")
+                empty.Size = UDim2.new(1, 0, 0, 24)
+                empty.BackgroundTransparency = 1
+                empty.Text = "no teams"
+                empty.TextColor3 = Colors.Muted
+                empty.Font = Enum.Font.Gotham
+                empty.TextSize = 11
+                empty.Parent = scroll
+                rows[#rows + 1] = empty
+                return
+            end
+
+            for i, key in ipairs(teams) do
+                local row = Instance.new("Frame")
+                row.Size = UDim2.new(1, 0, 0, 26)
+                row.BackgroundColor3 = Colors.Surface2
+                row.BorderSizePixel = 0
+                row.LayoutOrder = i
+                row.Parent = scroll
+                Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+
+                local nameLbl = Instance.new("TextLabel")
+                nameLbl.Size = UDim2.new(1, -60, 1, 0)
+                nameLbl.Position = UDim2.new(0, 8, 0, 0)
+                nameLbl.BackgroundTransparency = 1
+                nameLbl.Text = (key == "__none") and "(no team)" or key
+                nameLbl.TextColor3 = Colors.Text
+                nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+                nameLbl.Font = Enum.Font.Gotham
+                nameLbl.TextSize = 11
+                nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+                nameLbl.Parent = row
+
+                local tBtn = Instance.new("TextButton")
+                tBtn.Size = UDim2.new(0, 44, 1, -8)
+                tBtn.Position = UDim2.new(1, -48, 0, 4)
+                tBtn.BackgroundColor3 = Colors.Surface
+                tBtn.BorderSizePixel = 0
+                tBtn.AutoButtonColor = false
+                tBtn.Text = "OFF"
+                tBtn.Font = Enum.Font.GothamBold
+                tBtn.TextSize = 10
+                tBtn.TextColor3 = Colors.Muted
+                tBtn.Parent = row
+                Instance.new("UICorner", tBtn).CornerRadius = UDim.new(0, 4)
+
+                local function render()
+                    if SelectedTeams[key] then
+                        row.BackgroundColor3 = Colors.FriendBg
+                        tBtn.BackgroundColor3 = Colors.Friend
+                        tBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        tBtn.Text = "ON"
+                    else
+                        row.BackgroundColor3 = Colors.Surface2
+                        tBtn.BackgroundColor3 = Colors.Surface
+                        tBtn.TextColor3 = Colors.Muted
+                        tBtn.Text = "OFF"
+                    end
+                end
+
+                track(tBtn.MouseButton1Click:Connect(function()
+                    if SelectedTeams[key] then
+                        SelectedTeams[key] = nil
+                    else
+                        SelectedTeams[key] = true
+                    end
+                    recalcTeamFilter()
+                    saveTeams()
+                    render()
+                end))
+
+                render()
+                rows[#rows + 1] = row
+            end
+        end
+
+        rebuild()
+
+        local function hookTeam(plr)
+            track(plr:GetPropertyChangedSignal("Team"):Connect(function()
+                task_wait(0.05)
+                if not closed then rebuild() end
+            end))
+        end
+
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then hookTeam(plr) end
+        end
+
+        track(Players.PlayerAdded:Connect(function(plr)
+            hookTeam(plr)
+            task_wait(0.2)
+            if not closed then rebuild() end
+        end))
+        track(Players.PlayerRemoving:Connect(function()
+            task_wait(0.2)
+            if not closed then rebuild() end
+        end))
+
+        return container
+    end
+
+    -- =========================================================
+    -- player prefs
+    -- =========================================================
     local function makePlayerPrefsSection(order)
         local container = Instance.new("Frame")
         container.Size = UDim2.new(1, 0, 0, 190)
@@ -1442,6 +1657,9 @@ local function buildGui()
     makeToggle("npc",           "TargetNPCs",    nextOrder())
     makeToggle("enemy only",    "EnemyOnly",     nextOrder())
 
+    section("teams  ·  whitelist", nextOrder())
+    makeTeamsSection(nextOrder())
+
     section("player prefs  ·  F friend / E enemy", nextOrder())
     makePlayerPrefsSection(nextOrder())
 
@@ -1519,4 +1737,4 @@ task.defer(function() pcall(rebuildCandidates) end)
 
 print("[Aimbot] Loaded. Toggle: " .. bindLabel(Config.AimbotBind) ..
       " | Silent aim: " .. bindLabel(Config.SilentBind) ..
-      " | NPC: on | M4/M5 | prefs: F(green) E(red)")
+      " | NPC: on | M4/M5 | prefs: F(green) E(red) | teams: whitelist")
