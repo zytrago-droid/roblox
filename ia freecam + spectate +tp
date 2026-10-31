@@ -1,11 +1,16 @@
 --[[
-    [Camera Tools] — v12 (UI moderne, liste réparée)
+    [Camera Tools] — v14.2
     ─────────────────────────────────────────────────────────────
-    F  : toggle Freecam | V : toggle panneau
+    Le panneau s'affiche AUTOMATIQUEMENT au chargement.
+    F  : toggle Freecam (modifiable via le bouton "Key:" dans la card Freecam)
     Esc / Backspace : quitter spectate
     Clic droit en spectate : orbite
     Molette : vitesse (freecam) / zoom (spectate)
     Alt / Ctrl (freecam) : vitesse x3 / x0.25
+    Drag : uniquement via la barre de titre (header)
+    Resize : poignée ◢ en bas-droite du panneau (largeur + hauteur)
+
+    v14.2 — ajout du crédit "by azerty098890" dans le header
 --]]
 
 local Players          = game:GetService("Players")
@@ -29,29 +34,40 @@ local RENDER_STEP_NAME     = "UI_Update"
 local STOP_DEBOUNCE        = 0.15
 local TP_OFFSET_STUDS      = 3
 
--- Palette (thème sombre moderne, style Discord/Linear)
-local C_PANEL      = Color3.fromRGB(22, 24, 28)     -- #16181C
-local C_SURFACE    = Color3.fromRGB(30, 33, 38)     -- #1E2126
-local C_SURFACE_2  = Color3.fromRGB(38, 42, 48)     -- #262A30
-local C_HOVER      = Color3.fromRGB(48, 53, 60)     -- #30353C
-local C_BORDER     = Color3.fromRGB(50, 55, 62)     -- #32373E
-local C_TEXT       = Color3.fromRGB(240, 242, 245)  -- #F0F2F5
-local C_TEXT_MUTED = Color3.fromRGB(140, 148, 158)  -- #8C949E
-local C_GREEN      = Color3.fromRGB(16, 185, 129)   -- #10B981
+local MIN_W = 320
+local MIN_H = 500
+
+local C_PANEL      = Color3.fromRGB(22, 24, 28)
+local C_SURFACE    = Color3.fromRGB(30, 33, 38)
+local C_SURFACE_2  = Color3.fromRGB(38, 42, 48)
+local C_HOVER      = Color3.fromRGB(48, 53, 60)
+local C_BORDER     = Color3.fromRGB(50, 55, 62)
+local C_TEXT       = Color3.fromRGB(240, 242, 245)
+local C_TEXT_MUTED = Color3.fromRGB(140, 148, 158)
+local C_GREEN      = Color3.fromRGB(16, 185, 129)
 local C_GREEN_HOV  = Color3.fromRGB(20, 210, 145)
-local C_BLUE       = Color3.fromRGB(59, 130, 246)   -- #3B82F6
+local C_BLUE       = Color3.fromRGB(59, 130, 246)
 local C_BLUE_HOV   = Color3.fromRGB(80, 150, 255)
-local C_ORANGE     = Color3.fromRGB(245, 158, 11)   -- #F59E0B
+local C_ORANGE     = Color3.fromRGB(245, 158, 11)
 local C_ORANGE_HOV = Color3.fromRGB(255, 180, 50)
-local C_RED        = Color3.fromRGB(239, 68, 68)    -- #EF4444
+local C_RED        = Color3.fromRGB(239, 68, 68)
 local C_RED_HOV    = Color3.fromRGB(255, 90, 90)
-local C_VIOLET     = Color3.fromRGB(139, 92, 246)   -- #8B5CF6
+
+local RESERVED_KEYS = {
+    [Enum.KeyCode.W] = true, [Enum.KeyCode.A] = true,
+    [Enum.KeyCode.S] = true, [Enum.KeyCode.D] = true,
+    [Enum.KeyCode.Q] = true, [Enum.KeyCode.E] = true,
+    [Enum.KeyCode.Space] = true, [Enum.KeyCode.LeftShift] = true,
+    [Enum.KeyCode.LeftAlt] = true, [Enum.KeyCode.LeftControl] = true,
+    [Enum.KeyCode.Escape] = true, [Enum.KeyCode.Backspace] = true,
+}
 
 -- ============================================================
 -- §2. ÉTAT
 -- ============================================================
 local freecamActive  = false
 local freecamSpeed   = 50
+local freecamKey     = Enum.KeyCode.F
 local freecamYaw     = 0
 local freecamPitch   = 0
 local freecamPos     = Vector3.new(0, 0, 0)
@@ -73,6 +89,14 @@ local playerRows     = {}
 local rowCounter     = 0
 local keysDown       = {}
 
+local isDragging       = false
+local dragStart        = nil
+local dragStartPos     = nil
+local isResizing       = false
+local resizeStart      = nil
+local resizeStartSize  = nil
+local listeningForBind = false
+
 local connections = {}
 local function track(conn)
     table.insert(connections, conn)
@@ -81,15 +105,15 @@ end
 
 local scriptDestroyed = false
 
--- Forward declarations
 local speedLabel, freecamIndicator, searchBox
-local panel, freecamBtn, freecamStatus, spectateStopBtn, quickStopBtn
+local panel, contentFrame, header, freecamCard, spectateCard
+local freecamBtn, freecamStatus, spectateStopBtn, quickStopBtn
 local spectateIndicator, spectateList, slLayout, closeBtn
-local playersCountLabel
+local playersCountLabel, keybindBtn, resizeHandle, creditLabel
 
 local enableFreecam, disableFreecam
 local startSpectate, stopSpectate, updateSpectateCamera
-local destroyScript, doTP, updateCanvasSize
+local destroyScript, doTP, updateCanvasSize, updateCardSizes
 
 -- ============================================================
 -- §3. HELPERS PURS
@@ -198,29 +222,58 @@ screenGui.IgnoreGuiInset = true
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = guiParent
 
--- Panneau principal — taille fixe + offset bord droit
 panel = Instance.new("Frame", screenGui)
-panel.Size = UDim2.new(0, 360, 0, 700)
-panel.Position = UDim2.new(1, -380, 0.5, -350)
+panel.Size = UDim2.new(0, 360, 0, 750)
+panel.Position = UDim2.new(1, -380, 0.5, -375)
 panel.BackgroundColor3 = C_PANEL
 panel.BorderSizePixel = 0
-panel.Visible = false
+panel.Visible = true
 Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 14)
 local pStroke = Instance.new("UIStroke", panel)
 pStroke.Color = C_BORDER; pStroke.Thickness = 1
 
-local pPad = Instance.new("UIPadding", panel)
+contentFrame = Instance.new("Frame", panel)
+contentFrame.Size = UDim2.new(1, 0, 1, 0)
+contentFrame.BackgroundTransparency = 1
+contentFrame.BorderSizePixel = 0
+contentFrame.ZIndex = 1
+
+local pPad = Instance.new("UIPadding", contentFrame)
 pPad.PaddingTop = UDim.new(0, 10)
 pPad.PaddingBottom = UDim.new(0, 10)
 pPad.PaddingLeft = UDim.new(0, 10)
 pPad.PaddingRight = UDim.new(0, 10)
 
-local pLayout = Instance.new("UIListLayout", panel)
+local pLayout = Instance.new("UIListLayout", contentFrame)
 pLayout.Padding = UDim.new(0, 10)
 pLayout.SortOrder = Enum.SortOrder.LayoutOrder
 
--- ─── HEADER ───
-local header = Instance.new("Frame", panel)
+-- Poignée de resize
+resizeHandle = Instance.new("TextButton", panel)
+resizeHandle.Size = UDim2.new(0, 20, 0, 20)
+resizeHandle.Position = UDim2.new(1, -20, 1, -20)
+resizeHandle.BackgroundTransparency = 1
+resizeHandle.Text = "◢"
+resizeHandle.TextColor3 = C_TEXT_MUTED
+resizeHandle.TextSize = 16
+resizeHandle.Font = Enum.Font.GothamBold
+resizeHandle.BorderSizePixel = 0
+resizeHandle.TextXAlignment = Enum.TextXAlignment.Center
+resizeHandle.TextYAlignment = Enum.TextYAlignment.Center
+resizeHandle.AutoButtonColor = false
+resizeHandle.Active = false
+resizeHandle.Selectable = false
+resizeHandle.ZIndex = 5
+
+track(resizeHandle.MouseEnter:Connect(function()
+    if not isResizing then resizeHandle.TextColor3 = C_TEXT end
+end))
+track(resizeHandle.MouseLeave:Connect(function()
+    if not isResizing then resizeHandle.TextColor3 = C_TEXT_MUTED end
+end))
+
+-- Header draggable
+header = Instance.new("Frame", contentFrame)
 header.Size = UDim2.new(1, 0, 0, 40)
 header.BackgroundColor3 = C_SURFACE
 header.BorderSizePixel = 0
@@ -228,7 +281,7 @@ header.LayoutOrder = 1
 Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
 
 local headerTitle = Instance.new("TextLabel", header)
-headerTitle.Size = UDim2.new(1, -50, 1, 0)
+headerTitle.Size = UDim2.new(1, -190, 1, 0)   -- ⬅️ plus étroit
 headerTitle.Position = UDim2.new(0, 14, 0, 0)
 headerTitle.BackgroundTransparency = 1
 headerTitle.Text = "⚙  CAMERA TOOLS"
@@ -236,6 +289,20 @@ headerTitle.TextColor3 = C_TEXT
 headerTitle.Font = Enum.Font.GothamBold
 headerTitle.TextSize = 13
 headerTitle.TextXAlignment = Enum.TextXAlignment.Left
+headerTitle.Active = false
+
+-- ⬇️ NOUVEAU : crédit "by azerty098890"
+creditLabel = Instance.new("TextLabel", header)
+creditLabel.Size = UDim2.new(0, 120, 1, 0)
+creditLabel.Position = UDim2.new(1, -156, 0, 0)
+creditLabel.BackgroundTransparency = 1
+creditLabel.Text = "by azerty098890"
+creditLabel.TextColor3 = C_TEXT_MUTED
+creditLabel.Font = Enum.Font.Gotham
+creditLabel.TextSize = 10
+creditLabel.TextXAlignment = Enum.TextXAlignment.Right
+creditLabel.TextTruncate = Enum.TextTruncate.AtEnd
+creditLabel.Active = false
 
 closeBtn = Instance.new("TextButton", header)
 closeBtn.Size = UDim2.new(0, 28, 0, 28)
@@ -248,9 +315,9 @@ closeBtn.TextSize = 14
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
 applyHover(closeBtn, C_SURFACE_2, C_RED)
 
--- ─── CARD FREECAM ───
-local freecamCard = Instance.new("Frame", panel)
-freecamCard.Size = UDim2.new(1, 0, 0, 132)
+-- Card Freecam
+freecamCard = Instance.new("Frame", contentFrame)
+freecamCard.Size = UDim2.new(1, 0, 0, 178)
 freecamCard.BackgroundColor3 = C_SURFACE
 freecamCard.BorderSizePixel = 0
 freecamCard.LayoutOrder = 2
@@ -326,6 +393,19 @@ speedPlus.TextSize = 16
 Instance.new("UICorner", speedPlus).CornerRadius = UDim.new(0, 6)
 applyHover(speedPlus, C_SURFACE_2, C_HOVER)
 
+keybindBtn = Instance.new("TextButton", freecamCard)
+keybindBtn.Size = UDim2.new(1, 0, 0, 32)
+keybindBtn.BackgroundColor3 = C_SURFACE_2
+keybindBtn.Text = "🔑  Key: F"
+keybindBtn.TextColor3 = C_TEXT
+keybindBtn.Font = Enum.Font.GothamBold
+keybindBtn.TextSize = 11
+keybindBtn.LayoutOrder = 4
+Instance.new("UICorner", keybindBtn).CornerRadius = UDim.new(0, 6)
+local kbStroke = Instance.new("UIStroke", keybindBtn)
+kbStroke.Color = C_BORDER; kbStroke.Thickness = 1
+applyHover(keybindBtn, C_SURFACE_2, C_HOVER, kbStroke)
+
 freecamStatus = Instance.new("TextLabel", freecamCard)
 freecamStatus.Size = UDim2.new(1, 0, 0, 12)
 freecamStatus.BackgroundTransparency = 1
@@ -334,10 +414,10 @@ freecamStatus.TextColor3 = C_TEXT_MUTED
 freecamStatus.Font = Enum.Font.Gotham
 freecamStatus.TextSize = 9
 freecamStatus.TextXAlignment = Enum.TextXAlignment.Left
-freecamStatus.LayoutOrder = 4
+freecamStatus.LayoutOrder = 5
 
--- ─── CARD SPECTATE ───
-local spectateCard = Instance.new("Frame", panel)
+-- Card Spectate
+spectateCard = Instance.new("Frame", contentFrame)
 spectateCard.Size = UDim2.new(1, 0, 0, 480)
 spectateCard.BackgroundColor3 = C_SURFACE
 spectateCard.BorderSizePixel = 0
@@ -394,7 +474,6 @@ local sbPad = Instance.new("UIPadding", searchBox)
 sbPad.PaddingLeft = UDim.new(0, 10)
 sbPad.PaddingRight = UDim.new(0, 10)
 
--- ⚠️ BUG FIX : hauteur = 300px (avant : 0.5px)
 spectateList = Instance.new("ScrollingFrame", spectateCard)
 spectateList.Size = UDim2.new(1, 0, 0, 300)
 spectateList.BackgroundColor3 = C_PANEL
@@ -426,7 +505,7 @@ spectateStopBtn.Visible = false
 Instance.new("UICorner", spectateStopBtn).CornerRadius = UDim.new(0, 6)
 applyHover(spectateStopBtn, C_RED, C_RED_HOV)
 
--- ─── INDICATEURS HAUT-GAUCHE (pills) ───
+-- Indicateurs
 freecamIndicator = Instance.new("TextLabel", screenGui)
 freecamIndicator.Size = UDim2.new(0, 200, 0, 30)
 freecamIndicator.Position = UDim2.new(0, 12, 0, 12)
@@ -436,7 +515,7 @@ freecamIndicator.TextColor3 = Color3.fromRGB(255, 255, 255)
 freecamIndicator.Font = Enum.Font.GothamBold
 freecamIndicator.TextSize = 12
 freecamIndicator.Visible = false
-Instance.new("UICorner", freecamIndicator).CornerRadius = UDim.new(1, 0) -- pill
+Instance.new("UICorner", freecamIndicator).CornerRadius = UDim.new(1, 0)
 
 spectateIndicator = Instance.new("TextLabel", screenGui)
 spectateIndicator.Size = UDim2.new(0, 380, 0, 30)
@@ -463,7 +542,112 @@ Instance.new("UICorner", quickStopBtn).CornerRadius = UDim.new(1, 0)
 applyHover(quickStopBtn, C_RED, C_RED_HOV)
 
 -- ============================================================
--- §6. HELPERS GUI
+-- §6. LAYOUT ADAPTATIF
+-- ============================================================
+updateCardSizes = function()
+    task.defer(function()
+        if not panel or not panel.Parent then return end
+        local H = panel.AbsoluteSize.Y
+        local specH = math.max(240, H - 258)
+        spectateCard.Size = UDim2.new(1, 0, 0, specH)
+        local extra = spectateStopBtn.Visible and 40 or 0
+        local listH = math.max(100, specH - 84 - extra)
+        spectateList.Size = UDim2.new(1, 0, 0, listH)
+    end)
+end
+
+track(panel:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateCardSizes))
+
+-- ============================================================
+-- §7. DRAG (header) + RESIZE (poignée) — HANDLER UNIFIÉ
+-- ============================================================
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if scriptDestroyed then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+       and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    local mp = input.Position
+
+    -- 1) RESIZE d'abord (ignore gameProcessed)
+    if resizeHandle and resizeHandle.Parent then
+        local rp = resizeHandle.AbsolutePosition
+        local rs = resizeHandle.AbsoluteSize
+        if mp.X >= rp.X and mp.X <= rp.X + rs.X
+           and mp.Y >= rp.Y and mp.Y <= rp.Y + rs.Y then
+            isResizing = true
+            resizeStart = mp
+            resizeStartSize = { W = panel.AbsoluteSize.X, H = panel.AbsoluteSize.Y }
+            resizeHandle.TextColor3 = C_TEXT
+            return
+        end
+    end
+
+    -- 2) DRAG ensuite (respecte gameProcessed)
+    if gameProcessed then return end
+    if not header or not header.Parent then return end
+
+    local hp = header.AbsolutePosition
+    local hs = header.AbsoluteSize
+    if mp.X >= hp.X and mp.X <= hp.X + hs.X
+       and mp.Y >= hp.Y and mp.Y <= hp.Y + hs.Y then
+        if closeBtn and closeBtn.Parent then
+            local cp = closeBtn.AbsolutePosition
+            local cs = closeBtn.AbsoluteSize
+            if mp.X >= cp.X and mp.X <= cp.X + cs.X
+               and mp.Y >= cp.Y and mp.Y <= cp.Y + cs.Y then
+                return
+            end
+        end
+        isDragging = true
+        dragStart = mp
+        dragStartPos = panel.Position
+    end
+end))
+
+track(UserInputService.InputChanged:Connect(function(input)
+    if scriptDestroyed then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+       and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    if isResizing then
+        if not resizeStart or not resizeStartSize then return end
+        local d = input.Position - resizeStart
+        local newW = math.max(MIN_W, resizeStartSize.W + d.X)
+        local newH = math.max(MIN_H, resizeStartSize.H + d.Y)
+        panel.Size = UDim2.new(0, newW, 0, newH)
+        updateCardSizes()
+        return
+    end
+
+    if isDragging then
+        if not dragStart or not dragStartPos then return end
+        local d = input.Position - dragStart
+        panel.Position = UDim2.new(
+            dragStartPos.X.Scale, dragStartPos.X.Offset + d.X,
+            dragStartPos.Y.Scale, dragStartPos.Y.Offset + d.Y
+        )
+    end
+end))
+
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        isDragging = false
+        dragStart = nil
+        dragStartPos = nil
+        if isResizing then
+            isResizing = false
+            resizeStart = nil
+            resizeStartSize = nil
+            if resizeHandle and resizeHandle.Parent then
+                resizeHandle.TextColor3 = C_TEXT_MUTED
+            end
+        end
+    end
+end))
+
+-- ============================================================
+-- §8. HELPERS GUI
 -- ============================================================
 updateCanvasSize = function()
     task.defer(function()
@@ -503,7 +687,7 @@ local function applyFilter()
 end
 
 -- ============================================================
--- §7. TP
+-- §9. TP
 -- ============================================================
 doTP = function(player)
     if player == LocalPlayer then return end
@@ -538,7 +722,7 @@ doTP = function(player)
 end
 
 -- ============================================================
--- §8. ROW PLAYER (design compact et moderne)
+-- §10. ROW PLAYER
 -- ============================================================
 local function createRow(player)
     rowCounter = rowCounter + 1
@@ -557,7 +741,6 @@ local function createRow(player)
     head.Image = getThumb(player)
     Instance.new("UICorner", head).CornerRadius = UDim.new(0, 22)
 
-    -- Label nom (2 lignes : Display + @Name)
     local name = Instance.new("TextLabel", row)
     name.Size = UDim2.new(1, -200, 0, 16)
     name.Position = UDim2.new(0, 58, 0, 8)
@@ -580,7 +763,6 @@ local function createRow(player)
     handle.TextXAlignment = Enum.TextXAlignment.Left
     handle.TextTruncate = Enum.TextTruncate.AtEnd
 
-    -- Bouton TP (icône compacte)
     local tpBtn = Instance.new("TextButton", row)
     tpBtn.Size = UDim2.new(0, 40, 0, 24)
     tpBtn.Position = UDim2.new(1, -104, 0.5, -12)
@@ -592,7 +774,6 @@ local function createRow(player)
     Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0, 5)
     applyHover(tpBtn, C_ORANGE, C_ORANGE_HOV)
 
-    -- Bouton Spectate (icône compacte)
     local specBtn = Instance.new("TextButton", row)
     specBtn.Size = UDim2.new(0, 52, 0, 24)
     specBtn.Position = UDim2.new(1, -60, 0.5, -12)
@@ -644,7 +825,7 @@ local function removePlayerRow(player)
 end
 
 -- ============================================================
--- §9. FREECAM
+-- §11. FREECAM
 -- ============================================================
 enableFreecam = function()
     if scriptDestroyed or freecamActive then return end
@@ -757,7 +938,7 @@ local function updateFreecam(dt)
 end
 
 -- ============================================================
--- §10. SPECTATE
+-- §12. SPECTATE
 -- ============================================================
 local function smoothed(alpha, dt)
     return 1 - (1 - alpha) ^ (dt * 60)
@@ -855,8 +1036,8 @@ startSpectate = function(player)
     spectateStopBtn.Visible = true
     spectateIndicator.Visible = true
     quickStopBtn.Visible = true
+    updateCardSizes()
 
-    -- Feedback visuel sur la ligne ciblée
     local r = playerRows[player]
     if r and r.specBtn then
         r.specBtn.BackgroundColor3 = C_RED
@@ -872,7 +1053,6 @@ stopSpectate = function()
     if now - lastStopTime < STOP_DEBOUNCE then return end
     lastStopTime = now
 
-    -- Reset feedback ligne
     if spectateTarget then
         local r = playerRows[spectateTarget]
         if r and r.specBtn and r.specBtn.Parent then
@@ -898,11 +1078,12 @@ stopSpectate = function()
         if spectateStopBtn and spectateStopBtn.Parent then spectateStopBtn.Visible = false end
         if spectateIndicator and spectateIndicator.Parent then spectateIndicator.Visible = false end
         if quickStopBtn and quickStopBtn.Parent then quickStopBtn.Visible = false end
+        updateCardSizes()
     end
 end
 
 -- ============================================================
--- §11. BOUTONS / INPUTS
+-- §13. BOUTONS / KEYBIND
 -- ============================================================
 track(freecamBtn.MouseButton1Click:Connect(function()
     if scriptDestroyed then return end
@@ -918,12 +1099,46 @@ track(speedPlus.MouseButton1Click:Connect(function()
     freecamSpeed = math.min(500, freecamSpeed + 10); updateSpeedDisplay()
 end))
 
+track(keybindBtn.MouseButton1Click:Connect(function()
+    if scriptDestroyed then return end
+    listeningForBind = true
+    keybindBtn.Text = "🔑  Appuyez sur une touche..."
+    keybindBtn.BackgroundColor3 = C_BLUE
+end))
+
 track(closeBtn.MouseButton1Click:Connect(function()
     if destroyScript then destroyScript() end
 end))
 
+-- ============================================================
+-- §14. INPUTS CLAVIER
+-- ============================================================
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if scriptDestroyed then return end
+
+    if listeningForBind and input.UserInputType == Enum.UserInputType.Keyboard then
+        if input.KeyCode == Enum.KeyCode.Escape then
+            listeningForBind = false
+            keybindBtn.Text = "🔑  Key: " .. tostring(freecamKey.Name)
+            keybindBtn.BackgroundColor3 = C_SURFACE_2
+        elseif RESERVED_KEYS[input.KeyCode] then
+            keybindBtn.Text = "⚠  Touche réservée"
+            task.delay(0.9, function()
+                if keybindBtn and keybindBtn.Parent and not listeningForBind then
+                    keybindBtn.Text = "🔑  Key: " .. tostring(freecamKey.Name)
+                    keybindBtn.BackgroundColor3 = C_SURFACE_2
+                end
+            end)
+        else
+            freecamKey = input.KeyCode
+            listeningForBind = false
+            keybindBtn.Text = "🔑  Key: " .. freecamKey.Name
+            keybindBtn.BackgroundColor3 = C_SURFACE_2
+            flash(keybindBtn, C_GREEN, 0.2)
+        end
+        return
+    end
+
     if input.UserInputType == Enum.UserInputType.Keyboard then
         keysDown[input.KeyCode] = true
         if spectateActive and (input.KeyCode == Enum.KeyCode.Escape
@@ -932,11 +1147,9 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         end
     end
     if gameProcessed then return end
-    local k = input.KeyCode
-    if k == Enum.KeyCode.F then
+
+    if freecamKey and input.KeyCode == freecamKey then
         if freecamActive then disableFreecam() else enableFreecam() end
-    elseif k == Enum.KeyCode.V then
-        panel.Visible = not panel.Visible
     end
 end))
 
@@ -966,7 +1179,7 @@ end))
 track(searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter))
 
 -- ============================================================
--- §12. LIFECYCLE JOUEURS
+-- §15. LIFECYCLE JOUEURS
 -- ============================================================
 for _, p in ipairs(Players:GetPlayers()) do addPlayerRow(p) end
 track(Players.PlayerAdded:Connect(addPlayerRow))
@@ -989,7 +1202,7 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
 end))
 
 -- ============================================================
--- §13. BOUCLE RENDU
+-- §16. BOUCLE RENDU
 -- ============================================================
 RunService:BindToRenderStep(RENDER_STEP_NAME,
     Enum.RenderPriority.Camera.Value + 1,
@@ -1000,7 +1213,12 @@ RunService:BindToRenderStep(RENDER_STEP_NAME,
     end)
 
 -- ============================================================
--- §14. DESTROY
+-- §17. INIT
+-- ============================================================
+updateCardSizes()
+
+-- ============================================================
+-- §18. DESTROY
 -- ============================================================
 destroyScript = function()
     if scriptDestroyed then return end
@@ -1044,6 +1262,13 @@ destroyScript = function()
     spectateElevation = 0
     freecamActive = false
     spectateActive = false
+    isDragging = false
+    dragStart = nil
+    dragStartPos = nil
+    isResizing = false
+    resizeStart = nil
+    resizeStartSize = nil
+    listeningForBind = false
 
     pcall(function() if screenGui then screenGui:Destroy() end end)
     screenGui = nil
