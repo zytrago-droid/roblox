@@ -46,7 +46,6 @@ local CONFIG = {
     ALIGN_RESPONSIVENESS = 40,
 }
 
--- [FIX 2] Six/Four removed: they bled on AZERTY ('-' and ''' keys).
 local SPEED_UP_KEYS   = {Enum.KeyCode.LeftBracket}
 local SPEED_DOWN_KEYS = {Enum.KeyCode.RightBracket}
 
@@ -119,7 +118,6 @@ local function scanCharacterNoclip(char)
     end
 end
 
--- [FIX 5] BFS descends into Tool containers too.
 local function enforceNoclipSweep()
     if not NOCLIP_ENABLED then return end
     local c = character
@@ -142,7 +140,6 @@ local function enforceNoclipSweep()
     end
 end
 
--- [FIX 4] skip when Head is anchored (CFRAME mode).
 local function reaffirmOwnership()
     if not (NOCLIP_ENABLED or FLYING) then return end
     local c = character
@@ -431,6 +428,28 @@ statusLabel.Text = "engine: " .. currentEngine()
 statusLabel.TextColor3 = Color3.fromRGB(88, 200, 120)
 statusLabel.TextSize = 10
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+--// ============================================================
+--// SIGNATURE — bottom-left of the screen
+--// ============================================================
+local signatureLabel = Instance.new("TextLabel")
+signatureLabel.AnchorPoint = Vector2.new(0, 1)
+signatureLabel.Position = UDim2.new(0, 16, 1, -16)
+signatureLabel.Size = UDim2.new(0, 320, 0, 32)
+signatureLabel.BackgroundTransparency = 1
+signatureLabel.Text = "by azerty098890"
+signatureLabel.TextColor3 = Color3.fromRGB(0, 180, 255)
+signatureLabel.TextXAlignment = Enum.TextXAlignment.Left
+signatureLabel.TextYAlignment = Enum.TextYAlignment.Bottom
+signatureLabel.Font = Enum.Font.GothamBold
+signatureLabel.TextSize = 20
+signatureLabel.TextStrokeTransparency = 0.4
+signatureLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+signatureLabel.Parent = screenGui
+
+--// ============================================================
+--// END SIGNATURE
+--// ============================================================
 
 local function paintEngine()
     engineButton.Text = currentEngine()
@@ -834,7 +853,6 @@ local function startFlyInternal(preserveToggle)
         return
     end
     if not character or not character.Parent then return end
-    -- [FIX 6] humanoid nil OR detached
     if not humanoid or not humanoid.Parent then return end
     if humanoid.Health <= 0 then return end
     if not preserveToggle then isFlyToggledOn = true end
@@ -896,10 +914,6 @@ local function isSpeedDown(kc)
     return ok and s == "$"
 end
 
--- [FIX 1] `,` (AZERTY) no longer fires engine switch.
--- Semicolon = physical M on AZERTY -> always engine.
--- M (QWERTY position) = either QWERTY M ("m") or AZERTY ',' (",").
--- Only fires if GetString reports "m".
 local function isEngineKey(kc)
     if kc == Enum.KeyCode.Semicolon then return true end
     if kc == Enum.KeyCode.M then
@@ -969,7 +983,6 @@ end)
 
 closeButton.MouseButton1Click:Connect(function()
     stopFlyInternal(false)
-    -- [FIX 3] disconnect pending Died handler
     if flyHumanoidDiedConn then
         pcall(function() flyHumanoidDiedConn:Disconnect() end)
         flyHumanoidDiedConn = nil
