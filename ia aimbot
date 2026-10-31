@@ -1,8 +1,8 @@
 --!optimize 2
 -- ============================================================
 -- Aimbot | Xeno / AZERTY — maximum optimization
--- Aim assist + Silent aim + FOV circle + GUI + close + rebind
--- Toggle: F | Silent aim: V | M4/M5 | NPC | friend green / enemy red
+-- Aim assist + FOV circle + GUI + close + rebind
+-- Toggle: F | M4/M5 | NPC | friend green / enemy red
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -15,16 +15,16 @@ local workspace        = workspace
 local Vector2_new      = Vector2.new
 local Vector3_new      = Vector3.new
 local CFrame_lookAt    = CFrame.lookAt
-local Ray_new          = Ray.new
 local math_clamp       = math.clamp
 local math_random      = math.random
-local os_clock         = os.clock
-local table_clear      = table.clear
+local os_clock         = os.clock or tick or function() return 0 end
+local table_clear      = table.clear or function(t)
+    for k in pairs(t) do t[k] = nil end
+end
 local table_remove     = table.remove
 local table_sort       = table.sort
 local task_wait        = task.wait
 local task_spawn       = task.spawn
-local typeof_          = typeof
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -49,13 +49,13 @@ local m45Seen   = { [4] = false, [5] = false }
 
 local function extractMouseIndex(ut)
     if not ut then return nil end
-    local nm = ut.Name
-    if nm then
+    local okName, nm = pcall(function() return ut.Name end)
+    if okName and nm then
         local idx = tonumber(nm:match("MouseButton(%d+)"))
         if idx then return idx end
     end
-    local val = ut.Value
-    if val and val >= 1 and val <= 5 then return val end
+    local okVal, val = pcall(function() return ut.Value end)
+    if okVal and val and val >= 1 and val <= 5 then return val end
     return nil
 end
 
@@ -73,13 +73,47 @@ local function isBindDown(b)
 end
 
 -- ============================================================
+-- SAVE SYSTEM — panel size + position persisted to disk
+-- ============================================================
+local SAVE_FILE = "aimbot_config.json"
+local SaveData = {
+    panelW = nil,
+    panelH = nil,
+    panelX = nil,
+    panelY = nil,
+}
+
+local function loadSave()
+    if not readfile then return end
+    pcall(function()
+        if isfile and not isfile(SAVE_FILE) then return end
+        local raw = readfile(SAVE_FILE)
+        if type(raw) ~= "string" or raw == "" then return end
+        local decoded = HttpService:JSONDecode(raw)
+        if type(decoded) ~= "table" then return end
+        if type(decoded.panelW) == "number" then SaveData.panelW = decoded.panelW end
+        if type(decoded.panelH) == "number" then SaveData.panelH = decoded.panelH end
+        if type(decoded.panelX) == "number" then SaveData.panelX = decoded.panelX end
+        if type(decoded.panelY) == "number" then SaveData.panelY = decoded.panelY end
+    end)
+end
+
+local function writeSave()
+    if not writefile then return end
+    pcall(function()
+        writefile(SAVE_FILE, HttpService:JSONEncode(SaveData))
+    end)
+end
+
+loadSave()
+
+-- ============================================================
 -- CONFIG
 -- ============================================================
 local Config = {
     Enabled      = false,
     Held         = false,
     HoldToAim    = false,
-    SilentAim    = false,
     TeamCheck    = true,
     VisibleCheck = false,
     UsePrediction = true,
@@ -95,7 +129,6 @@ local Config = {
     HRPJitterRadius   = 0.65,
     CircleColor  = Color3.fromRGB(0, 200, 255),
     AimbotBind   = keyBind(Enum.KeyCode.F),
-    SilentBind   = keyBind(Enum.KeyCode.V),
 }
 
 local reservedKeys = {
@@ -107,9 +140,6 @@ local reservedKeys = {
 }
 if Config.AimbotBind.kind == "key" and reservedKeys[Config.AimbotBind.code] then
     Config.AimbotBind = keyBind(Enum.KeyCode.C)
-end
-if Config.SilentBind.kind == "key" and reservedKeys[Config.SilentBind.code] then
-    Config.SilentBind = keyBind(Enum.KeyCode.X)
 end
 
 -- ============================================================
@@ -197,7 +227,6 @@ loadTeams()
 local Connections     = {}
 local closed          = false
 local guiRef          = nil
-local originalNamecall = nil
 local renderConn      = nil
 local scanConn        = nil
 local guiConn         = nil
@@ -206,8 +235,7 @@ local function track(c) table.insert(Connections, c); return c end
 
 local fovCircle
 local candidates, candidateSet, candidateTeam, candidateOwner, partCache, hrpJitters
-local currentTarget, silentTarget
-local pendingSnap = false
+local currentTarget
 
 local function cleanup()
     if closed then return end
@@ -225,8 +253,6 @@ local function cleanup()
     Config.Enabled  = false
     Config.Held     = false
     currentTarget   = nil
-    silentTarget    = nil
-    pendingSnap     = false
 
     if fovCircle then
         pcall(function() fovCircle.Visible = false end)
@@ -237,16 +263,6 @@ local function cleanup()
 
     if guiRef then pcall(function() guiRef:Destroy() end) end
     guiRef = nil
-
-    if originalNamecall then
-        pcall(function()
-            local mt = getrawmetatable(game)
-            if setreadonly then pcall(setreadonly, mt, false) end
-            mt.__namecall = originalNamecall
-            if setreadonly then pcall(setreadonly, mt, true) end
-        end)
-        originalNamecall = nil
-    end
 
     if candidates     then table_clear(candidates)     end
     if candidateSet   then table_clear(candidateSet)   end
@@ -287,10 +303,12 @@ candidateTeam  = {}
 candidateOwner = {}
 partCache      = {}
 hrpJitters     = {}
-local candidateDirty = false
+local candidateDirty = true
 
 local function scanSubtree(root)
-    for _, obj in ipairs(root:GetDescendants()) do
+    local list = root:GetDescendants()
+    for i = 1, #list do
+        local obj = list[i]
         if obj:IsA("Model") and not candidateSet[obj] then
             local hum = obj:FindFirstChildOfClass("Humanoid")
             if hum and hum.Health > 0 and not Players:GetPlayerFromCharacter(obj) then
@@ -326,7 +344,7 @@ local function rebuildCandidates()
     candidates = {}
 
     if Config.TargetNPCs then
-        scanSubtree(workspace)
+        pcall(scanSubtree, workspace)
     end
 
     if Config.TargetPlayers then
@@ -426,7 +444,7 @@ local bestHit = { model = nil, part = nil, worldPos = nil, sx = 0, sy = 0 }
 local MAX_STUDS_SQ = 2000 * 2000
 
 local function findTarget()
-    local cam = cachedCamera
+    local cam = cachedCamera or workspace.CurrentCamera
     if not cam then return nil end
     local mouse = UserInputService:GetMouseLocation()
     local refX, refY
@@ -447,6 +465,23 @@ local function findTarget()
 
     local myTeam = LocalPlayer.Team
 
+    local teamCount = 0
+    local teamSeen = {}
+    do
+        local all = Players:GetPlayers()
+        for i = 1, #all do
+            local p = all[i]
+            if p ~= LocalPlayer then
+                local k = teamKeyOf(p)
+                if not teamSeen[k] then
+                    teamSeen[k] = true
+                    teamCount = teamCount + 1
+                end
+            end
+        end
+    end
+    local applyTeamFilter = teamFilterActive and teamCount >= 2
+
     for i = #candidates, 1, -1 do
         local model = candidates[i]
         if not model.Parent then
@@ -462,7 +497,7 @@ local function findTarget()
             if not skip then
                 local owner = candidateOwner[model]
 
-                if teamFilterActive and owner then
+                if applyTeamFilter and owner then
                     local tt = candidateTeam[model]
                     local key = tt and tt.Name or "__none"
                     if not SelectedTeams[key] then skip = true end
@@ -557,59 +592,6 @@ local function levenshtein(a, b)
 end
 
 -- ============================================================
--- SILENT AIM
--- ============================================================
-local silentHookInstalled = false
-local hookHead
-local function refreshHookRefs()
-    local c = LocalPlayer.Character
-    hookHead = c and c:FindFirstChild("Head")
-end
-refreshHookRefs()
-track(LocalPlayer.CharacterAdded:Connect(refreshHookRefs))
-
-local function installSilentHook()
-    if silentHookInstalled then return end
-    if not (hookfunction and getrawmetatable and getname) then return end
-
-    local ok = pcall(function()
-        local mt = getrawmetatable(game)
-        local function hook(self, ...)
-            if closed then return originalNamecall(self, ...) end
-            if silentTarget then
-                local method = getname(originalNamecall, ...)
-                local cam = cachedCamera
-                if method == "Raycast" then
-                    local a1, a2, a3 = ...
-                    if typeof_(a1) == "Vector3" then
-                        local nearCam  = (a1 - cam.CFrame.Position).Magnitude < 20
-                        local nearHead = hookHead and (a1 - hookHead.Position).Magnitude < 10
-                        if nearCam or nearHead then
-                            return originalNamecall(self, a1, silentTarget - a1, a3)
-                        end
-                    end
-                    return originalNamecall(self, a1, a2, a3)
-                elseif method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" then
-                    local a1, a2 = ...
-                    if typeof_(a1) == "Ray" then
-                        local nearCam  = (a1.Origin - cam.CFrame.Position).Magnitude < 20
-                        local nearHead = hookHead and (a1.Origin - hookHead.Position).Magnitude < 10
-                        if nearCam or nearHead then
-                            return originalNamecall(self, Ray_new(a1.Origin, silentTarget - a1.Origin), a2)
-                        end
-                    end
-                    return originalNamecall(self, a1, a2)
-                end
-            end
-            return originalNamecall(self, ...)
-        end
-        originalNamecall = hookfunction(mt.__namecall, hook)
-    end)
-    silentHookInstalled = ok
-end
-installSilentHook()
-
--- ============================================================
 -- REBIND STATE
 -- ============================================================
 local rebinding = nil
@@ -660,14 +642,6 @@ track(UserInputService.InputBegan:Connect(function(input, gp)
     if matches(Config.AimbotBind, input) then
         if not Config.HoldToAim then
             Config.Enabled = not Config.Enabled
-        end
-    elseif matches(Config.SilentBind, input) then
-        Config.SilentAim = not Config.SilentAim
-    end
-
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        if Config.SilentAim and not silentHookInstalled and currentTarget then
-            pendingSnap = true
         end
     end
 end))
@@ -726,16 +700,12 @@ scanConn = task_spawn(function()
     local sweepTick = 0
     while not closed do
         if candidateDirty then
-            pcall(rebuildCandidates)
+            local ok = pcall(rebuildCandidates)
+            if not ok then candidateDirty = true end
         end
 
         local t = findTarget()
         currentTarget = t
-        if Config.SilentAim then
-            silentTarget = t and t.worldPos or nil
-        else
-            silentTarget = nil
-        end
 
         sweepTick = sweepTick + 1
         if sweepTick >= 30 then
@@ -752,7 +722,7 @@ scanConn = task_spawn(function()
 end)
 
 -- ============================================================
--- RENDER LOOP — only camera, circle and snap
+-- RENDER LOOP
 -- ============================================================
 renderConn = RunService.RenderStepped:Connect(function(_dt)
     if closed then return end
@@ -761,12 +731,8 @@ renderConn = RunService.RenderStepped:Connect(function(_dt)
         Config.Held = isBindDown(Config.AimbotBind)
     end
 
-    local snapNow = pendingSnap
-    pendingSnap = false
-
     if not isActive() then
         if fovCircle.Visible then fovCircle.Visible = false end
-        silentTarget  = nil
         currentTarget = nil
         return
     end
@@ -775,12 +741,11 @@ renderConn = RunService.RenderStepped:Connect(function(_dt)
     local hum  = char and char:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then
         if fovCircle.Visible then fovCircle.Visible = false end
-        silentTarget  = nil
         currentTarget = nil
         return
     end
 
-    local cam = cachedCamera
+    local cam = cachedCamera or workspace.CurrentCamera
     if not cam then return end
 
     if not fovCircle.Visible then fovCircle.Visible = true end
@@ -799,14 +764,6 @@ renderConn = RunService.RenderStepped:Connect(function(_dt)
     end
 
     local t = currentTarget
-
-    if Config.SilentAim then
-        if snapNow and t then
-            cam.CFrame = CFrame_lookAt(cam.CFrame.Position, t.worldPos)
-        end
-        return
-    end
-
     if t then
         local desired = CFrame_lookAt(cam.CFrame.Position, t.worldPos)
         local alpha = math_clamp(1 - Config.Smoothing, 0.01, 1)
@@ -854,10 +811,24 @@ local function buildGui()
     local PANEL_MIN_W = 240
     local PANEL_MIN_H = 320
 
+    -- default panel size / position, overridden by saved values if present
+    local defW = 290
+    local defH = vpY - 120
+    local defX = -20   -- offset relative to right anchor
+    local defY = 60
+
+    local startW = SaveData.panelW or defW
+    local startH = SaveData.panelH or defH
+    local startX = SaveData.panelX or defX
+    local startY = SaveData.panelY or defY
+
+    startW = math_clamp(startW, PANEL_MIN_W, vpX - 40)
+    startH = math_clamp(startH, PANEL_MIN_H, vpY - 100)
+
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.new(0, 290, 0, vpY - 120)
+    panel.Size = UDim2.new(0, startW, 0, startH)
     panel.AnchorPoint = Vector2.new(1, 0)
-    panel.Position = UDim2.new(1, -20, 0, 60)
+    panel.Position = UDim2.new(1, startX, 0, startY)
     panel.BackgroundColor3 = Colors.Body
     panel.BorderSizePixel = 0
     panel.ClipsDescendants = true
@@ -872,7 +843,7 @@ local function buildGui()
     grad.Color = ColorSequence.new(Colors.Body2, Colors.Body)
 
     local titleBar = Instance.new("Frame")
-    titleBar.Size = UDim2.new(1, 0, 0, 42)
+    titleBar.Size = UDim2.new(1, 0, 0, 38)
     titleBar.BackgroundTransparency = 1
     titleBar.Parent = panel
 
@@ -896,8 +867,8 @@ local function buildGui()
     Instance.new("UICorner", dotGlow).CornerRadius = UDim.new(1, 0)
 
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -80, 0, 18)
-    title.Position = UDim2.new(0, 26, 0, 4)
+    title.Size = UDim2.new(1, -80, 1, 0)
+    title.Position = UDim2.new(0, 26, 0, 0)
     title.BackgroundTransparency = 1
     title.Text = "aimbot"
     title.TextColor3 = Colors.Text
@@ -905,17 +876,6 @@ local function buildGui()
     title.Font = Enum.Font.GothamMedium
     title.TextSize = 13
     title.Parent = titleBar
-
-    local subtitle = Instance.new("TextLabel")
-    subtitle.Size = UDim2.new(1, -80, 0, 14)
-    subtitle.Position = UDim2.new(0, 26, 0, 22)
-    subtitle.BackgroundTransparency = 1
-    subtitle.Text = "by azerty098890"
-    subtitle.TextColor3 = Colors.Muted
-    subtitle.TextXAlignment = Enum.TextXAlignment.Left
-    subtitle.Font = Enum.Font.Gotham
-    subtitle.TextSize = 9
-    subtitle.Parent = titleBar
 
     local closeBtn = Instance.new("TextButton")
     closeBtn.AnchorPoint = Vector2.new(1, 0.5)
@@ -943,15 +903,15 @@ local function buildGui()
 
     local divider = Instance.new("Frame")
     divider.Size = UDim2.new(1, 0, 0, 1)
-    divider.Position = UDim2.new(0, 0, 0, 42)
+    divider.Position = UDim2.new(0, 0, 0, 38)
     divider.BackgroundColor3 = Colors.Stroke
     divider.BackgroundTransparency = 0.35
     divider.BorderSizePixel = 0
     divider.Parent = panel
 
     local content = Instance.new("ScrollingFrame")
-    content.Size = UDim2.new(1, 0, 1, -51)
-    content.Position = UDim2.new(0, 0, 0, 51)
+    content.Size = UDim2.new(1, 0, 1, -47)
+    content.Position = UDim2.new(0, 0, 0, 47)
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
     content.CanvasSize = UDim2.new(0, 0, 0, 0)
@@ -973,6 +933,27 @@ local function buildGui()
     list.Padding = UDim.new(0, 6)
     list.SortOrder = Enum.SortOrder.LayoutOrder
 
+    -- =========================================================
+    -- signature at bottom-left of the screen
+    -- =========================================================
+    local sigLabel = Instance.new("TextLabel")
+    sigLabel.AnchorPoint = Vector2.new(0, 1)
+    sigLabel.Position = UDim2.new(0, 16, 1, -16)
+    sigLabel.Size = UDim2.new(0, 320, 0, 32)
+    sigLabel.BackgroundTransparency = 1
+    sigLabel.Text = "by azerty098890"
+    sigLabel.TextColor3 = Colors.Accent
+    sigLabel.TextXAlignment = Enum.TextXAlignment.Left
+    sigLabel.TextYAlignment = Enum.TextYAlignment.Bottom
+    sigLabel.Font = Enum.Font.GothamBold
+    sigLabel.TextSize = 20
+    sigLabel.TextStrokeTransparency = 0.4
+    sigLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    sigLabel.Parent = gui
+
+    -- =========================================================
+    -- resize grip (bottom-left of panel)
+    -- =========================================================
     local resizeGrip = Instance.new("TextButton")
     resizeGrip.AnchorPoint = Vector2.new(0, 1)
     resizeGrip.Size = UDim2.new(0, 16, 0, 16)
@@ -1025,6 +1006,11 @@ local function buildGui()
     end))
     track(UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if resizing then
+                SaveData.panelW = panel.Size.X.Offset
+                SaveData.panelH = panel.Size.Y.Offset
+                writeSave()
+            end
             resizing = false
         end
     end))
@@ -1709,7 +1695,6 @@ local function buildGui()
     section("general", nextOrder())
     makeToggle("enabled",       "Enabled",      nextOrder(), "AimbotBind",
         function() return Config.HoldToAim end)
-    makeToggle("silent aim",    "SilentAim",    nextOrder(), "SilentBind")
     makeToggle("hold to aim",   "HoldToAim",    nextOrder())
     makeToggle("team check",    "TeamCheck",    nextOrder())
     makeToggle("visible check", "VisibleCheck", nextOrder())
@@ -1775,6 +1760,11 @@ local function buildGui()
     end))
     track(UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if dragging then
+                SaveData.panelX = panel.Position.X.Offset
+                SaveData.panelY = panel.Position.Y.Offset
+                writeSave()
+            end
             dragging = false
         end
     end))
@@ -1795,8 +1785,13 @@ end
 
 pcall(buildGui)
 
-task.defer(function() pcall(rebuildCandidates) end)
+task.defer(function()
+    local ok, err = pcall(rebuildCandidates)
+    if not ok and err then
+        warn("[Aimbot] rebuild failed: " .. tostring(err))
+        candidateDirty = true
+    end
+end)
 
 print("[Aimbot] Loaded. Toggle: " .. bindLabel(Config.AimbotBind) ..
-      " | Silent aim: " .. bindLabel(Config.SilentBind) ..
       " | NPC: on | M4/M5 | prefs: F(green) E(red) | teams: whitelist")
