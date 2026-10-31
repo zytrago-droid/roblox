@@ -11,12 +11,10 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService     = game:GetService("TweenService")
 local HttpService      = game:GetService("HttpService")
 
--- hot-path locals (documented: caching nested lookups is beneficial)
 local workspace        = workspace
 local Vector2_new      = Vector2.new
 local Vector3_new      = Vector3.new
 local CFrame_lookAt    = CFrame.lookAt
-local CFrame_new       = CFrame.new
 local Ray_new          = Ray.new
 local math_clamp       = math.clamp
 local math_random      = math.random
@@ -850,10 +848,14 @@ local function buildGui()
     gui.Parent = parent
     guiRef = gui
 
-    -- Fixed-height panel: fills viewport with 60px margin top and bottom.
-    -- Title bar + divider stay pinned; the content below scrolls.
+    local vpY = (cachedCamera and cachedCamera.ViewportSize.Y) or 1080
+    local vpX = (cachedCamera and cachedCamera.ViewportSize.X) or 1920
+
+    local PANEL_MIN_W = 240
+    local PANEL_MIN_H = 320
+
     local panel = Instance.new("Frame")
-    panel.Size = UDim2.new(0, 290, 1, -120)
+    panel.Size = UDim2.new(0, 290, 0, vpY - 120)
     panel.AnchorPoint = Vector2.new(1, 0)
     panel.Position = UDim2.new(1, -20, 0, 60)
     panel.BackgroundColor3 = Colors.Body
@@ -870,7 +872,7 @@ local function buildGui()
     grad.Color = ColorSequence.new(Colors.Body2, Colors.Body)
 
     local titleBar = Instance.new("Frame")
-    titleBar.Size = UDim2.new(1, 0, 0, 38)
+    titleBar.Size = UDim2.new(1, 0, 0, 42)
     titleBar.BackgroundTransparency = 1
     titleBar.Parent = panel
 
@@ -894,8 +896,8 @@ local function buildGui()
     Instance.new("UICorner", dotGlow).CornerRadius = UDim.new(1, 0)
 
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -80, 1, 0)
-    title.Position = UDim2.new(0, 26, 0, 0)
+    title.Size = UDim2.new(1, -80, 0, 18)
+    title.Position = UDim2.new(0, 26, 0, 4)
     title.BackgroundTransparency = 1
     title.Text = "aimbot"
     title.TextColor3 = Colors.Text
@@ -903,6 +905,17 @@ local function buildGui()
     title.Font = Enum.Font.GothamMedium
     title.TextSize = 13
     title.Parent = titleBar
+
+    local subtitle = Instance.new("TextLabel")
+    subtitle.Size = UDim2.new(1, -80, 0, 14)
+    subtitle.Position = UDim2.new(0, 26, 0, 22)
+    subtitle.BackgroundTransparency = 1
+    subtitle.Text = "by azerty098890"
+    subtitle.TextColor3 = Colors.Muted
+    subtitle.TextXAlignment = Enum.TextXAlignment.Left
+    subtitle.Font = Enum.Font.Gotham
+    subtitle.TextSize = 9
+    subtitle.Parent = titleBar
 
     local closeBtn = Instance.new("TextButton")
     closeBtn.AnchorPoint = Vector2.new(1, 0.5)
@@ -930,16 +943,15 @@ local function buildGui()
 
     local divider = Instance.new("Frame")
     divider.Size = UDim2.new(1, 0, 0, 1)
-    divider.Position = UDim2.new(0, 0, 0, 38)
+    divider.Position = UDim2.new(0, 0, 0, 42)
     divider.BackgroundColor3 = Colors.Stroke
     divider.BackgroundTransparency = 0.35
     divider.BorderSizePixel = 0
     divider.Parent = panel
 
-    -- Scrolling content area with automatic canvas sizing
     local content = Instance.new("ScrollingFrame")
-    content.Size = UDim2.new(1, 0, 1, -47)
-    content.Position = UDim2.new(0, 0, 0, 47)
+    content.Size = UDim2.new(1, 0, 1, -51)
+    content.Position = UDim2.new(0, 0, 0, 51)
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
     content.CanvasSize = UDim2.new(0, 0, 0, 0)
@@ -960,6 +972,62 @@ local function buildGui()
     local list = Instance.new("UIListLayout", content)
     list.Padding = UDim.new(0, 6)
     list.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local resizeGrip = Instance.new("TextButton")
+    resizeGrip.AnchorPoint = Vector2.new(0, 1)
+    resizeGrip.Size = UDim2.new(0, 16, 0, 16)
+    resizeGrip.Position = UDim2.new(0, 4, 1, -4)
+    resizeGrip.BackgroundColor3 = Colors.Surface
+    resizeGrip.BackgroundTransparency = 0.4
+    resizeGrip.BorderSizePixel = 0
+    resizeGrip.AutoButtonColor = false
+    resizeGrip.Text = "⋱"
+    resizeGrip.TextColor3 = Colors.Muted
+    resizeGrip.Font = Enum.Font.GothamBold
+    resizeGrip.TextSize = 12
+    resizeGrip.ZIndex = 5
+    resizeGrip.Parent = panel
+    Instance.new("UICorner", resizeGrip).CornerRadius = UDim.new(0, 4)
+
+    local gripInfo = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    track(resizeGrip.MouseEnter:Connect(function()
+        TweenService:Create(resizeGrip, gripInfo, {
+            BackgroundTransparency = 0,
+            TextColor3 = Colors.Accent,
+        }):Play()
+    end))
+    track(resizeGrip.MouseLeave:Connect(function()
+        TweenService:Create(resizeGrip, gripInfo, {
+            BackgroundTransparency = 0.4,
+            TextColor3 = Colors.Muted,
+        }):Play()
+    end))
+
+    local resizing, resizeStart, resizeStartSize = false, nil, nil
+    track(resizeGrip.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            resizing = true
+            resizeStart = input.Position
+            resizeStartSize = panel.Size
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if resizing and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = input.Position - resizeStart
+            local curVpX = (cachedCamera and cachedCamera.ViewportSize.X) or vpX
+            local curVpY = (cachedCamera and cachedCamera.ViewportSize.Y) or vpY
+            local newW = resizeStartSize.X.Offset - d.X
+            local newH = resizeStartSize.Y.Offset + d.Y
+            newW = math_clamp(newW, PANEL_MIN_W, curVpX - 40)
+            newH = math_clamp(newH, PANEL_MIN_H, curVpY - 100)
+            panel.Size = UDim2.new(0, newW, 0, newH)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            resizing = false
+        end
+    end))
 
     local function section(text, order)
         local row = Instance.new("Frame")
@@ -1274,9 +1342,6 @@ local function buildGui()
         end))
     end
 
-    -- =========================================================
-    -- teams whitelist
-    -- =========================================================
     local function makeTeamsSection(order)
         local container = Instance.new("Frame")
         container.Size = UDim2.new(1, 0, 0, 150)
@@ -1434,9 +1499,6 @@ local function buildGui()
         return container
     end
 
-    -- =========================================================
-    -- player prefs
-    -- =========================================================
     local function makePlayerPrefsSection(order)
         local container = Instance.new("Frame")
         container.Size = UDim2.new(1, 0, 0, 190)
