@@ -1,5 +1,5 @@
 --[[
-    [Camera Tools] — v14.2
+    [Camera Tools] — v15
     ─────────────────────────────────────────────────────────────
     Le panneau s'affiche AUTOMATIQUEMENT au chargement.
     F  : toggle Freecam (modifiable via le bouton "Key:" dans la card Freecam)
@@ -10,7 +10,8 @@
     Drag : uniquement via la barre de titre (header)
     Resize : poignée ◢ en bas-droite du panneau (largeur + hauteur)
 
-    v14.2 — ajout du crédit "by azerty098890" dans le header
+    Signature "by azerty098890" en bas-gauche de l'écran,
+    permanente tant que le script tourne.
 --]]
 
 local Players          = game:GetService("Players")
@@ -52,6 +53,7 @@ local C_ORANGE     = Color3.fromRGB(245, 158, 11)
 local C_ORANGE_HOV = Color3.fromRGB(255, 180, 50)
 local C_RED        = Color3.fromRGB(239, 68, 68)
 local C_RED_HOV    = Color3.fromRGB(255, 90, 90)
+local C_SIGNATURE  = Color3.fromRGB(0, 180, 255)
 
 local RESERVED_KEYS = {
     [Enum.KeyCode.W] = true, [Enum.KeyCode.A] = true,
@@ -109,7 +111,7 @@ local speedLabel, freecamIndicator, searchBox
 local panel, contentFrame, header, freecamCard, spectateCard
 local freecamBtn, freecamStatus, spectateStopBtn, quickStopBtn
 local spectateIndicator, spectateList, slLayout, closeBtn
-local playersCountLabel, keybindBtn, resizeHandle, creditLabel
+local playersCountLabel, keybindBtn, resizeHandle, signatureLabel
 
 local enableFreecam, disableFreecam
 local startSpectate, stopSpectate, updateSpectateCamera
@@ -222,6 +224,28 @@ screenGui.IgnoreGuiInset = true
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = guiParent
 
+-- ══════════════════════════════════════════════════════════════
+-- SIGNATURE "by azerty098890" — bas-gauche de l'écran, permanente
+-- ══════════════════════════════════════════════════════════════
+signatureLabel = Instance.new("TextLabel", screenGui)
+signatureLabel.Name = "SignatureLabel"
+signatureLabel.AnchorPoint = Vector2.new(0, 1)
+signatureLabel.Position = UDim2.new(0, 16, 1, -16)
+signatureLabel.Size = UDim2.new(0, 320, 0, 32)
+signatureLabel.BackgroundTransparency = 1
+signatureLabel.Text = "by azerty098890"
+signatureLabel.TextColor3 = Color3.fromRGB(0, 180, 255)
+signatureLabel.Font = Enum.Font.GothamBold
+signatureLabel.TextSize = 20
+signatureLabel.TextXAlignment = Enum.TextXAlignment.Left
+signatureLabel.TextYAlignment = Enum.TextYAlignment.Bottom
+signatureLabel.TextStrokeTransparency = 0.4
+signatureLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+signatureLabel.Active = false
+signatureLabel.Selectable = false
+signatureLabel.ZIndex = 10
+
+-- ─── PANNEAU ───
 panel = Instance.new("Frame", screenGui)
 panel.Size = UDim2.new(0, 360, 0, 750)
 panel.Position = UDim2.new(1, -380, 0.5, -375)
@@ -281,7 +305,7 @@ header.LayoutOrder = 1
 Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
 
 local headerTitle = Instance.new("TextLabel", header)
-headerTitle.Size = UDim2.new(1, -190, 1, 0)   -- ⬅️ plus étroit
+headerTitle.Size = UDim2.new(1, -50, 1, 0)
 headerTitle.Position = UDim2.new(0, 14, 0, 0)
 headerTitle.BackgroundTransparency = 1
 headerTitle.Text = "⚙  CAMERA TOOLS"
@@ -290,19 +314,6 @@ headerTitle.Font = Enum.Font.GothamBold
 headerTitle.TextSize = 13
 headerTitle.TextXAlignment = Enum.TextXAlignment.Left
 headerTitle.Active = false
-
--- ⬇️ NOUVEAU : crédit "by azerty098890"
-creditLabel = Instance.new("TextLabel", header)
-creditLabel.Size = UDim2.new(0, 120, 1, 0)
-creditLabel.Position = UDim2.new(1, -156, 0, 0)
-creditLabel.BackgroundTransparency = 1
-creditLabel.Text = "by azerty098890"
-creditLabel.TextColor3 = C_TEXT_MUTED
-creditLabel.Font = Enum.Font.Gotham
-creditLabel.TextSize = 10
-creditLabel.TextXAlignment = Enum.TextXAlignment.Right
-creditLabel.TextTruncate = Enum.TextTruncate.AtEnd
-creditLabel.Active = false
 
 closeBtn = Instance.new("TextButton", header)
 closeBtn.Size = UDim2.new(0, 28, 0, 28)
@@ -559,7 +570,7 @@ end
 track(panel:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateCardSizes))
 
 -- ============================================================
--- §7. DRAG (header) + RESIZE (poignée) — HANDLER UNIFIÉ
+-- §7. DRAG + RESIZE
 -- ============================================================
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if scriptDestroyed then return end
@@ -568,7 +579,6 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 
     local mp = input.Position
 
-    -- 1) RESIZE d'abord (ignore gameProcessed)
     if resizeHandle and resizeHandle.Parent then
         local rp = resizeHandle.AbsolutePosition
         local rs = resizeHandle.AbsoluteSize
@@ -582,7 +592,6 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         end
     end
 
-    -- 2) DRAG ensuite (respecte gameProcessed)
     if gameProcessed then return end
     if not header or not header.Parent then return end
 
@@ -1270,8 +1279,10 @@ destroyScript = function()
     resizeStartSize = nil
     listeningForBind = false
 
+    -- Le ScreenGui contient la signature → sa destruction la retire aussi.
     pcall(function() if screenGui then screenGui:Destroy() end end)
     screenGui = nil
+    signatureLabel = nil
 
     print("[Camera Tools] Closed.")
 end
