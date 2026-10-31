@@ -1,0 +1,60 @@
+--!optimize 2
+-- remote_instant_copy.lua — scan and copy to clipboard, no GUI, no hooks
+
+local REMOTE_CLASSES = {
+    RemoteEvent = true,
+    RemoteFunction = true,
+    UnreliableRemoteEvent = true,
+    BindableEvent = true,
+    BindableFunction = true,
+}
+
+local remotes = {}
+
+-- scan
+pcall(function()
+    for _, obj in ipairs(game:GetDescendants()) do
+        local ok, cls = pcall(function() return obj.ClassName end)
+        if ok and REMOTE_CLASSES[cls] then
+            local path = pcall(function() return obj:GetFullName() end) and obj:GetFullName() or "?"
+            table.insert(remotes, string.format("[%s] %s", cls, path))
+        end
+    end
+end)
+
+-- sort
+table.sort(remotes, function(a, b) return a < b end)
+
+-- build text
+local lines = {}
+table.insert(lines, "=== REMOTE DUMP ===")
+table.insert(lines, "PlaceId: " .. tostring(game.PlaceId))
+table.insert(lines, "Total: " .. tostring(#remotes))
+table.insert(lines, "===================\n")
+for _, line in ipairs(remotes) do
+    table.insert(lines, line)
+end
+local textBuffer = table.concat(lines, "\n")
+
+-- copy to clipboard
+local copied = false
+pcall(function()
+    if setclipboard then
+        setclipboard(textBuffer)
+        copied = true
+    elseif toclipboard then
+        toclipboard(textBuffer)
+        copied = true
+    elseif writeclipboard then
+        writeclipboard(textBuffer)
+        copied = true
+    end
+end)
+
+-- feedback
+if copied then
+    print(string.format("[REMOTE-DUMP] Successfully copied %d remotes to your clipboard!", #remotes))
+else
+    warn("[REMOTE-DUMP] setclipboard failed or not found. Printing to console instead (Ctrl+A / Ctrl+C) :")
+    print(textBuffer)
+end
