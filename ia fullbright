@@ -1,0 +1,318 @@
+--[[
+    Universal Full Bright — Xeno compatible
+    Toggle: RightControl  |  GUI button
+    
+    Ce script modifie les propriétés du service Lighting pour supprimer l'ombre
+    et la noirceur. Il inclut un watchdog qui réapplique les valeurs si le jeu
+    tente de les réinitialiser.
+    
+    Sources:
+    - ScriptBlox "Universal Script | FullBright" : Ambient = 255, OutdoorAmbient = 255, Brightness = 2.
+    - Pastebin "Universal FullBright (Super Safe x100)" : Brightness = 1.2, Ambient = 185,
+      OutdoorAmbient = 175, FogStart = 0, FogEnd = 9999999, Technology = Compatibility.
+    - Roblox Creator Hub : Ambient contrôle la lumière dans les zones ombragées,
+      ClockTime contrôle l'heure du jour, Brightness contrôle l'intensité globale.
+    
+    Limite honnête : si le jeu utilise un script serveur qui force le retour du
+    lighting original (anti-cheat ou cycle jour/nuit), le watchdog réappliquera
+    les valeurs côté client, mais le serveur peut les écraser à chaque frame.
+    Le full bright reste une modification locale.
+]]
+
+if _G.FullBrightLoaded then return end
+_G.FullBrightLoaded = true
+
+local Lighting      = game:GetService("Lighting")
+local RunService    = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService  = game:GetService("TweenService")
+local StarterGui    = game:GetService("StarterGui")
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
+local CONFIG = {
+    TOGGLE_KEY       = Enum.KeyCode.RightControl,
+    -- Valeurs cibles (inspirées de ScriptBlox et Pastebin)
+    TARGET_BRIGHTNESS       = 2,           -- ScriptBlox utilise 2, Pastebin 1.2. On prend 2 pour un effet franc.
+    TARGET_AMBIENT          = Color3.fromRGB(255, 255, 255),
+    TARGET_OUTDOOR_AMBIENT  = Color3.fromRGB(255, 255, 255),
+    TARGET_FOG_START        = 0,
+    TARGET_FOG_END          = 9999999,
+    TARGET_CLOCK_TIME       = 14,          -- midi, évite que le cycle jour/nuit assombrisse
+    TARGET_SHADOW_SOFTNESS  = 0,
+    TARGET_GLOBAL_SHADOWS   = false,
+    TARGET_ENVIRONMENT_DIFFUSE = 0,        -- réduit la lumière ambiante du ciel
+    TARGET_ENVIRONMENT_SPECULAR = 0,
+    WATCHDOG_INTERVAL       = 2,           -- secondes entre chaque réapplication
+}
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local ENABLED       = false
+local WATCHDOG_ALIVE = true
+local original      = {}
+local watchdogConn  = nil
+local changedConn   = nil
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function notify(title, text, dur)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title, Text = text, Duration = dur or 3,
+        })
+    end)
+end
+
+local function saveOriginal()
+    original = {
+        Brightness = Lighting.Brightness,
+        Ambient = Lighting.Ambient,
+        OutdoorAmbient = Lighting.OutdoorAmbient,
+        FogStart = Lighting.FogStart,
+        FogEnd = Lighting.FogEnd,
+        ClockTime = Lighting.ClockTime,
+        ShadowSoftness = Lighting.ShadowSoftness,
+        GlobalShadows = Lighting.GlobalShadows,
+        EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale,
+        EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale,
+    }
+end
+
+local function applyFullBright()
+    if not ENABLED then return end
+    pcall(function()
+        Lighting.Brightness = CONFIG.TARGET_BRIGHTNESS
+        Lighting.Ambient = CONFIG.TARGET_AMBIENT
+        Lighting.OutdoorAmbient = CONFIG.TARGET_OUTDOOR_AMBIENT
+        Lighting.FogStart = CONFIG.TARGET_FOG_START
+        Lighting.FogEnd = CONFIG.TARGET_FOG_END
+        Lighting.ClockTime = CONFIG.TARGET_CLOCK_TIME
+        Lighting.ShadowSoftness = CONFIG.TARGET_SHADOW_SOFTNESS
+        Lighting.GlobalShadows = CONFIG.TARGET_GLOBAL_SHADOWS
+        Lighting.EnvironmentDiffuseScale = CONFIG.TARGET_ENVIRONMENT_DIFFUSE
+        Lighting.EnvironmentSpecularScale = CONFIG.TARGET_ENVIRONMENT_SPECULAR
+    end)
+end
+
+local function restoreOriginal()
+    pcall(function()
+        for k, v in pairs(original) do
+            if Lighting[k] ~= nil then
+                Lighting[k] = v
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- SUPPRESSION DES EFFETS DE POST-TRAITEMENT
+-- (ColorCorrection, Blur, etc. peuvent assombrir même avec Ambient à 255)
+-- ============================================================
+local savedEffects = {}
+
+local function disablePostEffects()
+    for _, effect in ipairs(Lighting:GetChildren()) do
+        if effect:IsA("ColorCorrectionEffect")
+            or effect:IsA("BlurEffect")
+            or effect:IsA("SunRaysEffect")
+            or effect:IsA("DepthOfFieldEffect")
+            or effect:IsA("BloomEffect") then
+            if not savedEffects[effect] then
+                savedEffects[effect] = {
+                    Enabled = effect.Enabled,
+                }
+            end
+            pcall(function() effect.Enabled = false end)
+        end
+    end
+end
+
+local function restorePostEffects()
+    for effect, state in pairs(savedEffects) do
+        if effect and effect.Parent then
+            pcall(function() effect.Enabled = state.Enabled end)
+        end
+    end
+    savedEffects = {}
+end
+
+-- ============================================================
+-- WATCHDOG (protège contre les resets du jeu)
+-- ============================================================
+local function startWatchdog()
+    if watchdogConn then return end
+    watchdogConn = task.spawn(function()
+        while WATCHDOG_ALIVE and ENABLED do
+            task.wait(CONFIG.WATCHDOG_INTERVAL)
+            if ENABLED then
+                applyFullBright()
+                disablePostEffects()
+            end
+        end
+    end)
+end
+
+local function stopWatchdog()
+    WATCHDOG_ALIVE = false
+    if watchdogConn then
+        task.cancel(watchdogConn)
+        watchdogConn = nil
+    end
+end
+
+-- Protection contre les scripts qui modifient Lighting.Changed
+local function startChangedProtection()
+    if changedConn then return end
+    changedConn = Lighting.Changed:Connect(function()
+        if ENABLED then
+            task.defer(applyFullBright)
+            task.defer(disablePostEffects)
+        end
+    end)
+end
+
+local function stopChangedProtection()
+    if changedConn then
+        changedConn:Disconnect()
+        changedConn = nil
+    end
+end
+
+-- ============================================================
+-- TOGGLE
+-- ============================================================
+local function setFullBright(state)
+    ENABLED = state
+    if state then
+        saveOriginal()
+        applyFullBright()
+        disablePostEffects()
+        WATCHDOG_ALIVE = true
+        startWatchdog()
+        startChangedProtection()
+        notify("Full Bright", "ON", 2)
+    else
+        stopWatchdog()
+        stopChangedProtection()
+        restoreOriginal()
+        restorePostEffects()
+        notify("Full Bright", "OFF", 2)
+    end
+end
+
+-- ============================================================
+-- GUI
+-- ============================================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "FullBrightGui"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.Parent = game:GetService("CoreGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 200, 0, 80)
+frame.Position = UDim2.new(0.5, -100, 0.1, 0)
+frame.BackgroundColor3 = Color3.fromRGB(30, 32, 35)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = screenGui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+local stroke = Instance.new("UIStroke", frame)
+stroke.Color = Color3.fromRGB(70, 73, 78)
+stroke.Thickness = 1
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 0, 24)
+title.Position = UDim2.new(0, 10, 0, 4)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextColor3 = Color3.fromRGB(235, 235, 240)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "Full Bright"
+title.Parent = frame
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 16)
+status.Position = UDim2.new(0, 10, 0, 28)
+status.BackgroundTransparency = 1
+status.Font = Enum.Font.Code
+status.TextSize = 11
+status.TextColor3 = Color3.fromRGB(160, 200, 160)
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Text = "OFF"
+status.Parent = frame
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(1, -20, 0, 26)
+toggleBtn.Position = UDim2.new(0, 10, 0, 48)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 63, 68)
+toggleBtn.BorderSizePixel = 0
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 12
+toggleBtn.TextColor3 = Color3.fromRGB(240, 240, 245)
+toggleBtn.Text = "Enable Full Bright"
+toggleBtn.Parent = frame
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 5)
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 16, 0, 16)
+closeBtn.Position = UDim2.new(1, -22, 0, 4)
+closeBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+closeBtn.Text = "X"
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 10
+closeBtn.TextColor3 = Color3.new(1, 1, 1)
+closeBtn.BorderSizePixel = 0
+closeBtn.Parent = frame
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(1, 0)
+
+local function updateUI()
+    if ENABLED then
+        toggleBtn.Text = "Disable Full Bright"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 110, 70)
+        status.Text = "ON"
+        status.TextColor3 = Color3.fromRGB(100, 220, 140)
+    else
+        toggleBtn.Text = "Enable Full Bright"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 63, 68)
+        status.Text = "OFF"
+        status.TextColor3 = Color3.fromRGB(160, 160, 160)
+    end
+end
+
+toggleBtn.MouseButton1Click:Connect(function()
+    setFullBright(not ENABLED)
+    updateUI()
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    if ENABLED then
+        setFullBright(false)
+    end
+    _G.FullBrightLoaded = false
+    screenGui:Destroy()
+end)
+
+-- ============================================================
+-- KEYBIND
+-- ============================================================
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == CONFIG.TOGGLE_KEY then
+        setFullBright(not ENABLED)
+        updateUI()
+    end
+end)
+
+-- ============================================================
+-- BOOT
+-- ============================================================
+updateUI()
+notify("Full Bright", "Loaded. RightControl = toggle", 3)
+print("[FullBright] Loaded. RightControl = toggle.")
