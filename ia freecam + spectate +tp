@@ -1,33 +1,55 @@
 --[[
-    [Freecam + Spectate] — v9 (stable)
-    F  : toggle Freecam
-    V  : toggle panneau
+    [Camera Tools] — v12 (UI moderne, liste réparée)
+    ─────────────────────────────────────────────────────────────
+    F  : toggle Freecam | V : toggle panneau
     Esc / Backspace : quitter spectate
-    Clic droit en spectate : orbite autour de la cible
+    Clic droit en spectate : orbite
     Molette : vitesse (freecam) / zoom (spectate)
     Alt / Ctrl (freecam) : vitesse x3 / x0.25
-    TP | recherche | bouton flottant "✕ STOP" | "✕ Fermer"
 --]]
 
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
 local Workspace        = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = Workspace.CurrentCamera
 
 -- ============================================================
--- CONSTANTES / ÉTAT
+-- §1. CONSTANTES / PALETTE
 -- ============================================================
 local FREECAM_SENSITIVITY  = 0.003
 local SPECTATE_SENSITIVITY = 0.005
 local SPECTATE_MIN_DIST    = 2
 local SPECTATE_MAX_DIST    = 50
 local SPECTATE_SMOOTH      = 0.20
-local RENDER_STEP_NAME     = "FCS_Update"
+local RENDER_STEP_NAME     = "UI_Update"
 local STOP_DEBOUNCE        = 0.15
+local TP_OFFSET_STUDS      = 3
 
+-- Palette (thème sombre moderne, style Discord/Linear)
+local C_PANEL      = Color3.fromRGB(22, 24, 28)     -- #16181C
+local C_SURFACE    = Color3.fromRGB(30, 33, 38)     -- #1E2126
+local C_SURFACE_2  = Color3.fromRGB(38, 42, 48)     -- #262A30
+local C_HOVER      = Color3.fromRGB(48, 53, 60)     -- #30353C
+local C_BORDER     = Color3.fromRGB(50, 55, 62)     -- #32373E
+local C_TEXT       = Color3.fromRGB(240, 242, 245)  -- #F0F2F5
+local C_TEXT_MUTED = Color3.fromRGB(140, 148, 158)  -- #8C949E
+local C_GREEN      = Color3.fromRGB(16, 185, 129)   -- #10B981
+local C_GREEN_HOV  = Color3.fromRGB(20, 210, 145)
+local C_BLUE       = Color3.fromRGB(59, 130, 246)   -- #3B82F6
+local C_BLUE_HOV   = Color3.fromRGB(80, 150, 255)
+local C_ORANGE     = Color3.fromRGB(245, 158, 11)   -- #F59E0B
+local C_ORANGE_HOV = Color3.fromRGB(255, 180, 50)
+local C_RED        = Color3.fromRGB(239, 68, 68)    -- #EF4444
+local C_RED_HOV    = Color3.fromRGB(255, 90, 90)
+local C_VIOLET     = Color3.fromRGB(139, 92, 246)   -- #8B5CF6
+
+-- ============================================================
+-- §2. ÉTAT
+-- ============================================================
 local freecamActive  = false
 local freecamSpeed   = 50
 local freecamYaw     = 0
@@ -42,7 +64,7 @@ local spectateTarget    = nil
 local spectateDistance  = 8
 local spectateYaw       = 0
 local spectateElevation = 0
-local currentOrbitCF    = nil   -- CFrame persistante de l'orbite
+local currentOrbitCF    = nil
 local lastStopTime      = 0
 
 local thumbnailCache = {}
@@ -50,10 +72,6 @@ local thumbLoading   = {}
 local playerRows     = {}
 local rowCounter     = 0
 local keysDown       = {}
-
--- === FIX v9 : forward-declare les éléments GUI utilisés par les helpers ===
--- Sans ceci, updateSpeedDisplay et applyFilter référencent des globales nil.
-local speedLabel, freecamIndicator, searchBox
 
 local connections = {}
 local function track(conn)
@@ -63,17 +81,18 @@ end
 
 local scriptDestroyed = false
 
-local guiParent = game:GetService("CoreGui")
-if gethui then pcall(function() guiParent = gethui() end) end
-
-print("[Freecam+Spectate] Loaded (v9). F = Freecam, V = Spectate panel.")
+-- Forward declarations
+local speedLabel, freecamIndicator, searchBox
+local panel, freecamBtn, freecamStatus, spectateStopBtn, quickStopBtn
+local spectateIndicator, spectateList, slLayout, closeBtn
+local playersCountLabel
 
 local enableFreecam, disableFreecam
 local startSpectate, stopSpectate, updateSpectateCamera
-local destroyScript
+local destroyScript, doTP, updateCanvasSize
 
 -- ============================================================
--- HELPERS (sans dépendance GUI)
+-- §3. HELPERS PURS
 -- ============================================================
 local function getLocalCharacter()
     local char = LocalPlayer.Character
@@ -85,9 +104,7 @@ end
 
 local function getThumb(player, forceRefresh)
     local uid = player.UserId
-    if not forceRefresh and thumbnailCache[uid] then
-        return thumbnailCache[uid]
-    end
+    if not forceRefresh and thumbnailCache[uid] then return thumbnailCache[uid] end
     if thumbLoading[uid] then
         return "https://www.roblox.com/headshot-thumbnail/image?userId="
             .. tostring(uid) .. "&width=420&height=420&format=png"
@@ -99,8 +116,7 @@ local function getThumb(player, forceRefresh)
     end)
     thumbLoading[uid] = nil
     local url
-    if ok and type(result) == "string" and #result > 0 then
-        url = result
+    if ok and type(result) == "string" and #result > 0 then url = result
     else
         url = "https://www.roblox.com/headshot-thumbnail/image?userId="
             .. tostring(uid) .. "&width=420&height=420&format=png"
@@ -134,306 +150,472 @@ local function restoreCharacterVisibility()
 end
 
 local function releaseTextFocus()
-    local focused = UserInputService:GetFocusedTextBox()
-    if focused then pcall(function() focused:ReleaseFocus() end) end
+    local f = UserInputService:GetFocusedTextBox()
+    if f then pcall(function() f:ReleaseFocus() end) end
 end
 
 -- ============================================================
--- GUI
+-- §4. HELPERS ANIMATION
 -- ============================================================
+local function applyHover(btn, baseColor, hoverColor, strokeRef)
+    track(btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.12, Enum.EasingStyle.Quart),
+            { BackgroundColor3 = hoverColor }):Play()
+        if strokeRef then
+            TweenService:Create(strokeRef, TweenInfo.new(0.12),
+                { Thickness = 1.5, Color = Color3.fromRGB(90, 100, 110) }):Play()
+        end
+    end))
+    track(btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.12, Enum.EasingStyle.Quart),
+            { BackgroundColor3 = baseColor }):Play()
+        if strokeRef then
+            TweenService:Create(strokeRef, TweenInfo.new(0.12),
+                { Thickness = 1, Color = C_BORDER }):Play()
+        end
+    end))
+end
+
+local function flash(btn, color, duration)
+    if not btn or not btn.Parent then return end
+    local orig = btn.BackgroundColor3
+    btn.BackgroundColor3 = color
+    task.delay(duration or 0.15, function()
+        if btn and btn.Parent then btn.BackgroundColor3 = orig end
+    end)
+end
+
+-- ============================================================
+-- §5. CONSTRUCTION GUI
+-- ============================================================
+local guiParent = game:GetService("CoreGui")
+if gethui then pcall(function() guiParent = gethui() end) end
+
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "FreecamSpectateUI"
+screenGui.Name = "UI_A"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = guiParent
 
-local panel = Instance.new("Frame", screenGui)
-panel.Size = UDim2.new(0, 320, 0, 640)
-panel.Position = UDim2.new(1, -340, 0.5, -320)
-panel.BackgroundColor3 = Color3.fromRGB(30, 32, 35)
+-- Panneau principal — taille fixe + offset bord droit
+panel = Instance.new("Frame", screenGui)
+panel.Size = UDim2.new(0, 360, 0, 700)
+panel.Position = UDim2.new(1, -380, 0.5, -350)
+panel.BackgroundColor3 = C_PANEL
 panel.BorderSizePixel = 0
 panel.Visible = false
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 14)
 local pStroke = Instance.new("UIStroke", panel)
-pStroke.Color = Color3.fromRGB(80, 85, 90); pStroke.Thickness = 1.5
+pStroke.Color = C_BORDER; pStroke.Thickness = 1
+
 local pPad = Instance.new("UIPadding", panel)
 pPad.PaddingTop = UDim.new(0, 10)
 pPad.PaddingBottom = UDim.new(0, 10)
 pPad.PaddingLeft = UDim.new(0, 10)
 pPad.PaddingRight = UDim.new(0, 10)
+
 local pLayout = Instance.new("UIListLayout", panel)
-pLayout.Padding = UDim.new(0, 8)
+pLayout.Padding = UDim.new(0, 10)
 pLayout.SortOrder = Enum.SortOrder.LayoutOrder
 
-local freecamTitle = Instance.new("TextLabel", panel)
-freecamTitle.Size = UDim2.new(1, 0, 0, 22)
+-- ─── HEADER ───
+local header = Instance.new("Frame", panel)
+header.Size = UDim2.new(1, 0, 0, 40)
+header.BackgroundColor3 = C_SURFACE
+header.BorderSizePixel = 0
+header.LayoutOrder = 1
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
+
+local headerTitle = Instance.new("TextLabel", header)
+headerTitle.Size = UDim2.new(1, -50, 1, 0)
+headerTitle.Position = UDim2.new(0, 14, 0, 0)
+headerTitle.BackgroundTransparency = 1
+headerTitle.Text = "⚙  CAMERA TOOLS"
+headerTitle.TextColor3 = C_TEXT
+headerTitle.Font = Enum.Font.GothamBold
+headerTitle.TextSize = 13
+headerTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+closeBtn = Instance.new("TextButton", header)
+closeBtn.Size = UDim2.new(0, 28, 0, 28)
+closeBtn.Position = UDim2.new(1, -34, 0.5, -14)
+closeBtn.BackgroundColor3 = C_SURFACE_2
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = C_TEXT_MUTED
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+applyHover(closeBtn, C_SURFACE_2, C_RED)
+
+-- ─── CARD FREECAM ───
+local freecamCard = Instance.new("Frame", panel)
+freecamCard.Size = UDim2.new(1, 0, 0, 132)
+freecamCard.BackgroundColor3 = C_SURFACE
+freecamCard.BorderSizePixel = 0
+freecamCard.LayoutOrder = 2
+Instance.new("UICorner", freecamCard).CornerRadius = UDim.new(0, 8)
+
+local fcPad = Instance.new("UIPadding", freecamCard)
+fcPad.PaddingTop = UDim.new(0, 10)
+fcPad.PaddingBottom = UDim.new(0, 10)
+fcPad.PaddingLeft = UDim.new(0, 12)
+fcPad.PaddingRight = UDim.new(0, 12)
+
+local fcLayout = Instance.new("UIListLayout", freecamCard)
+fcLayout.Padding = UDim.new(0, 8)
+fcLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local freecamTitle = Instance.new("TextLabel", freecamCard)
+freecamTitle.Size = UDim2.new(1, 0, 0, 16)
 freecamTitle.BackgroundTransparency = 1
-freecamTitle.Text = "FREECAM  (F)"
-freecamTitle.TextColor3 = Color3.fromRGB(230, 230, 230)
+freecamTitle.Text = "🎥  FREECAM"
+freecamTitle.TextColor3 = C_GREEN
 freecamTitle.Font = Enum.Font.GothamBold
-freecamTitle.TextSize = 13
+freecamTitle.TextSize = 11
 freecamTitle.TextXAlignment = Enum.TextXAlignment.Left
 freecamTitle.LayoutOrder = 1
 
-local freecamBtn = Instance.new("TextButton", panel)
-freecamBtn.Size = UDim2.new(1, 0, 0, 32)
-freecamBtn.BackgroundColor3 = Color3.fromRGB(50, 55, 60)
+freecamBtn = Instance.new("TextButton", freecamCard)
+freecamBtn.Size = UDim2.new(1, 0, 0, 34)
+freecamBtn.BackgroundColor3 = C_SURFACE_2
 freecamBtn.Text = "Enable Freecam"
-freecamBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
-freecamBtn.Font = Enum.Font.Gotham
-freecamBtn.TextSize = 13
+freecamBtn.TextColor3 = C_TEXT
+freecamBtn.Font = Enum.Font.GothamBold
+freecamBtn.TextSize = 12
 freecamBtn.LayoutOrder = 2
 Instance.new("UICorner", freecamBtn).CornerRadius = UDim.new(0, 6)
+local fbStroke = Instance.new("UIStroke", freecamBtn)
+fbStroke.Color = C_BORDER; fbStroke.Thickness = 1
+applyHover(freecamBtn, C_SURFACE_2, C_HOVER, fbStroke)
 
-local speedRow = Instance.new("Frame", panel)
-speedRow.Size = UDim2.new(1, 0, 0, 28)
-speedRow.BackgroundColor3 = Color3.fromRGB(40, 43, 47)
+local speedRow = Instance.new("Frame", freecamCard)
+speedRow.Size = UDim2.new(1, 0, 0, 32)
+speedRow.BackgroundColor3 = C_SURFACE_2
 speedRow.BorderSizePixel = 0
 speedRow.LayoutOrder = 3
 Instance.new("UICorner", speedRow).CornerRadius = UDim.new(0, 6)
 
 local speedMinus = Instance.new("TextButton", speedRow)
-speedMinus.Size = UDim2.new(0, 32, 1, 0)
-speedMinus.BackgroundColor3 = Color3.fromRGB(60, 65, 70)
-speedMinus.Text = "-"
-speedMinus.TextColor3 = Color3.fromRGB(255, 255, 255)
+speedMinus.Size = UDim2.new(0, 36, 1, 0)
+speedMinus.BackgroundColor3 = C_SURFACE_2
+speedMinus.Text = "−"
+speedMinus.TextColor3 = C_TEXT
 speedMinus.Font = Enum.Font.GothamBold
 speedMinus.TextSize = 16
 Instance.new("UICorner", speedMinus).CornerRadius = UDim.new(0, 6)
+applyHover(speedMinus, C_SURFACE_2, C_HOVER)
 
 speedLabel = Instance.new("TextLabel", speedRow)
-speedLabel.Size = UDim2.new(1, -72, 1, 0)
-speedLabel.Position = UDim2.new(0, 36, 0, 0)
+speedLabel.Size = UDim2.new(1, -80, 1, 0)
+speedLabel.Position = UDim2.new(0, 40, 0, 0)
 speedLabel.BackgroundTransparency = 1
-speedLabel.Text = "Speed: " .. freecamSpeed
-speedLabel.TextColor3 = Color3.fromRGB(230, 230, 230)
+speedLabel.Text = "Speed: 50"
+speedLabel.TextColor3 = C_TEXT
 speedLabel.Font = Enum.Font.Gotham
-speedLabel.TextSize = 12
+speedLabel.TextSize = 11
 
 local speedPlus = Instance.new("TextButton", speedRow)
-speedPlus.Size = UDim2.new(0, 32, 1, 0)
-speedPlus.Position = UDim2.new(1, -32, 0, 0)
-speedPlus.BackgroundColor3 = Color3.fromRGB(60, 65, 70)
+speedPlus.Size = UDim2.new(0, 36, 1, 0)
+speedPlus.Position = UDim2.new(1, -36, 0, 0)
+speedPlus.BackgroundColor3 = C_SURFACE_2
 speedPlus.Text = "+"
-speedPlus.TextColor3 = Color3.fromRGB(255, 255, 255)
+speedPlus.TextColor3 = C_TEXT
 speedPlus.Font = Enum.Font.GothamBold
 speedPlus.TextSize = 16
 Instance.new("UICorner", speedPlus).CornerRadius = UDim.new(0, 6)
+applyHover(speedPlus, C_SURFACE_2, C_HOVER)
 
-local freecamStatus = Instance.new("TextLabel", panel)
-freecamStatus.Size = UDim2.new(1, 0, 0, 16)
+freecamStatus = Instance.new("TextLabel", freecamCard)
+freecamStatus.Size = UDim2.new(1, 0, 0, 12)
 freecamStatus.BackgroundTransparency = 1
 freecamStatus.Text = "Status: OFF"
-freecamStatus.TextColor3 = Color3.fromRGB(180, 180, 180)
+freecamStatus.TextColor3 = C_TEXT_MUTED
 freecamStatus.Font = Enum.Font.Gotham
-freecamStatus.TextSize = 11
+freecamStatus.TextSize = 9
 freecamStatus.TextXAlignment = Enum.TextXAlignment.Left
 freecamStatus.LayoutOrder = 4
 
-local spectateTitle = Instance.new("TextLabel", panel)
-spectateTitle.Size = UDim2.new(1, 0, 0, 22)
+-- ─── CARD SPECTATE ───
+local spectateCard = Instance.new("Frame", panel)
+spectateCard.Size = UDim2.new(1, 0, 0, 480)
+spectateCard.BackgroundColor3 = C_SURFACE
+spectateCard.BorderSizePixel = 0
+spectateCard.LayoutOrder = 3
+Instance.new("UICorner", spectateCard).CornerRadius = UDim.new(0, 8)
+
+local scPad = Instance.new("UIPadding", spectateCard)
+scPad.PaddingTop = UDim.new(0, 10)
+scPad.PaddingBottom = UDim.new(0, 10)
+scPad.PaddingLeft = UDim.new(0, 12)
+scPad.PaddingRight = UDim.new(0, 12)
+
+local scLayout = Instance.new("UIListLayout", spectateCard)
+scLayout.Padding = UDim.new(0, 8)
+scLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local spectateTitle = Instance.new("TextLabel", spectateCard)
+spectateTitle.Size = UDim2.new(1, -100, 0, 16)
 spectateTitle.BackgroundTransparency = 1
-spectateTitle.Text = "SPECTATE  (V)  — clic droit = orbite"
-spectateTitle.TextColor3 = Color3.fromRGB(230, 230, 230)
+spectateTitle.Text = "👁  SPECTATE"
+spectateTitle.TextColor3 = C_BLUE
 spectateTitle.Font = Enum.Font.GothamBold
 spectateTitle.TextSize = 11
 spectateTitle.TextXAlignment = Enum.TextXAlignment.Left
-spectateTitle.LayoutOrder = 5
+spectateTitle.LayoutOrder = 1
 
-searchBox = Instance.new("TextBox", panel)
-searchBox.Size = UDim2.new(1, 0, 0, 28)
-searchBox.BackgroundColor3 = Color3.fromRGB(22, 24, 27)
+playersCountLabel = Instance.new("TextLabel", spectateCard)
+playersCountLabel.Size = UDim2.new(0, 90, 0, 16)
+playersCountLabel.Position = UDim2.new(1, -90, 0, 0)
+playersCountLabel.BackgroundTransparency = 1
+playersCountLabel.Text = "0 en ligne"
+playersCountLabel.TextColor3 = C_TEXT_MUTED
+playersCountLabel.Font = Enum.Font.Gotham
+playersCountLabel.TextSize = 9
+playersCountLabel.TextXAlignment = Enum.TextXAlignment.Right
+playersCountLabel.LayoutOrder = 1
+
+searchBox = Instance.new("TextBox", spectateCard)
+searchBox.Size = UDim2.new(1, 0, 0, 32)
+searchBox.BackgroundColor3 = C_SURFACE_2
 searchBox.BorderSizePixel = 0
-searchBox.PlaceholderText = "Rechercher un joueur..."
+searchBox.PlaceholderText = "🔍  Rechercher un joueur..."
 searchBox.Text = ""
-searchBox.TextColor3 = Color3.fromRGB(230, 230, 230)
-searchBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 130)
+searchBox.TextColor3 = C_TEXT
+searchBox.PlaceholderColor3 = C_TEXT_MUTED
 searchBox.Font = Enum.Font.Gotham
-searchBox.TextSize = 12
+searchBox.TextSize = 11
 searchBox.ClearTextOnFocus = false
-searchBox.LayoutOrder = 6
+searchBox.LayoutOrder = 2
 Instance.new("UICorner", searchBox).CornerRadius = UDim.new(0, 6)
 local sbStroke = Instance.new("UIStroke", searchBox)
-sbStroke.Color = Color3.fromRGB(60, 65, 70); sbStroke.Thickness = 1
+sbStroke.Color = C_BORDER; sbStroke.Thickness = 1
 local sbPad = Instance.new("UIPadding", searchBox)
-sbPad.PaddingLeft = UDim.new(0, 8)
-sbPad.PaddingRight = UDim.new(0, 8)
+sbPad.PaddingLeft = UDim.new(0, 10)
+sbPad.PaddingRight = UDim.new(0, 10)
 
-local spectateList = Instance.new("ScrollingFrame", panel)
+-- ⚠️ BUG FIX : hauteur = 300px (avant : 0.5px)
+spectateList = Instance.new("ScrollingFrame", spectateCard)
 spectateList.Size = UDim2.new(1, 0, 0, 300)
-spectateList.BackgroundColor3 = Color3.fromRGB(22, 24, 27)
+spectateList.BackgroundColor3 = C_PANEL
 spectateList.BorderSizePixel = 0
 spectateList.ScrollBarThickness = 4
+spectateList.ScrollBarImageColor3 = C_BORDER
 spectateList.CanvasSize = UDim2.new(0, 0, 0, 0)
-spectateList.LayoutOrder = 7
+spectateList.ScrollingDirection = Enum.ScrollingDirection.Y
+spectateList.LayoutOrder = 3
 Instance.new("UICorner", spectateList).CornerRadius = UDim.new(0, 6)
-local slLayout = Instance.new("UIListLayout", spectateList)
-slLayout.Padding = UDim.new(0, 4)
+slLayout = Instance.new("UIListLayout", spectateList)
+slLayout.Padding = UDim.new(0, 6)
 slLayout.SortOrder = Enum.SortOrder.LayoutOrder
 local slPad = Instance.new("UIPadding", spectateList)
-slPad.PaddingLeft = UDim.new(0, 4)
-slPad.PaddingRight = UDim.new(0, 4)
-slPad.PaddingTop = UDim.new(0, 4)
-slPad.PaddingBottom = UDim.new(0, 4)
+slPad.PaddingLeft = UDim.new(0, 6)
+slPad.PaddingRight = UDim.new(0, 6)
+slPad.PaddingTop = UDim.new(0, 6)
+slPad.PaddingBottom = UDim.new(0, 6)
 
-local spectateStopBtn = Instance.new("TextButton", panel)
+spectateStopBtn = Instance.new("TextButton", spectateCard)
 spectateStopBtn.Size = UDim2.new(1, 0, 0, 32)
-spectateStopBtn.BackgroundColor3 = Color3.fromRGB(120, 50, 50)
-spectateStopBtn.Text = "Stop Spectate"
-spectateStopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-spectateStopBtn.Font = Enum.Font.Gotham
-spectateStopBtn.TextSize = 13
-spectateStopBtn.LayoutOrder = 8
+spectateStopBtn.BackgroundColor3 = C_RED
+spectateStopBtn.Text = "⏹  Stop Spectate"
+spectateStopBtn.TextColor3 = C_TEXT
+spectateStopBtn.Font = Enum.Font.GothamBold
+spectateStopBtn.TextSize = 12
+spectateStopBtn.LayoutOrder = 4
 spectateStopBtn.Visible = false
 Instance.new("UICorner", spectateStopBtn).CornerRadius = UDim.new(0, 6)
+applyHover(spectateStopBtn, C_RED, C_RED_HOV)
 
-local closeBtn = Instance.new("TextButton", panel)
-closeBtn.Size = UDim2.new(1, 0, 0, 32)
-closeBtn.BackgroundColor3 = Color3.fromRGB(160, 40, 40)
-closeBtn.Text = "✕  Fermer le script"
-closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 13
-closeBtn.LayoutOrder = 99
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
-
+-- ─── INDICATEURS HAUT-GAUCHE (pills) ───
 freecamIndicator = Instance.new("TextLabel", screenGui)
-freecamIndicator.Size = UDim2.new(0, 170, 0, 26)
-freecamIndicator.Position = UDim2.new(0, 10, 0, 10)
-freecamIndicator.BackgroundColor3 = Color3.fromRGB(20, 110, 45)
-freecamIndicator.Text = "FREECAM"
+freecamIndicator.Size = UDim2.new(0, 200, 0, 30)
+freecamIndicator.Position = UDim2.new(0, 12, 0, 12)
+freecamIndicator.BackgroundColor3 = C_GREEN
+freecamIndicator.Text = "🎥  FREECAM  ·  50 u/s"
 freecamIndicator.TextColor3 = Color3.fromRGB(255, 255, 255)
 freecamIndicator.Font = Enum.Font.GothamBold
-freecamIndicator.TextSize = 13
+freecamIndicator.TextSize = 12
 freecamIndicator.Visible = false
-Instance.new("UICorner", freecamIndicator).CornerRadius = UDim.new(0, 6)
+Instance.new("UICorner", freecamIndicator).CornerRadius = UDim.new(1, 0) -- pill
 
-local spectateIndicator = Instance.new("TextLabel", screenGui)
-spectateIndicator.Size = UDim2.new(0, 340, 0, 26)
-spectateIndicator.Position = UDim2.new(0, 10, 0, 42)
-spectateIndicator.BackgroundColor3 = Color3.fromRGB(30, 85, 170)
-spectateIndicator.Text = "SPECTATE"
+spectateIndicator = Instance.new("TextLabel", screenGui)
+spectateIndicator.Size = UDim2.new(0, 380, 0, 30)
+spectateIndicator.Position = UDim2.new(0, 12, 0, 48)
+spectateIndicator.BackgroundColor3 = C_BLUE
+spectateIndicator.Text = "👁  SPECTATE"
 spectateIndicator.TextColor3 = Color3.fromRGB(255, 255, 255)
 spectateIndicator.Font = Enum.Font.GothamBold
-spectateIndicator.TextSize = 13
+spectateIndicator.TextSize = 12
 spectateIndicator.Visible = false
-Instance.new("UICorner", spectateIndicator).CornerRadius = UDim.new(0, 6)
+Instance.new("UICorner", spectateIndicator).CornerRadius = UDim.new(1, 0)
 
-local quickStopBtn = Instance.new("TextButton", screenGui)
-quickStopBtn.Size = UDim2.new(0, 70, 0, 26)
-quickStopBtn.Position = UDim2.new(0, 358, 0, 42)
-quickStopBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-quickStopBtn.Text = "✕ STOP"
+quickStopBtn = Instance.new("TextButton", screenGui)
+quickStopBtn.Size = UDim2.new(0, 90, 0, 30)
+quickStopBtn.Position = UDim2.new(0, 400, 0, 48)
+quickStopBtn.BackgroundColor3 = C_RED
+quickStopBtn.Text = "✕  STOP"
 quickStopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 quickStopBtn.Font = Enum.Font.GothamBold
-quickStopBtn.TextSize = 12
+quickStopBtn.TextSize = 11
 quickStopBtn.Visible = false
 quickStopBtn.ZIndex = 10
-Instance.new("UICorner", quickStopBtn).CornerRadius = UDim.new(0, 6)
+Instance.new("UICorner", quickStopBtn).CornerRadius = UDim.new(1, 0)
+applyHover(quickStopBtn, C_RED, C_RED_HOV)
 
 -- ============================================================
--- HELPERS (avec GUI — maintenant tous les éléments existent)
+-- §6. HELPERS GUI
 -- ============================================================
+updateCanvasSize = function()
+    task.defer(function()
+        if not spectateList or not spectateList.Parent or not slLayout then return end
+        local abs = slLayout.AbsoluteContentSize
+        spectateList.CanvasSize = UDim2.new(0, 0, 0, abs.Y + 16)
+    end)
+end
+track(slLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCanvasSize))
+
 local function updateSpeedDisplay()
     if speedLabel and speedLabel.Parent then
         speedLabel.Text = "Speed: " .. math.floor(freecamSpeed)
     end
     if freecamIndicator and freecamIndicator.Parent then
-        freecamIndicator.Text = "FREECAM  (" .. math.floor(freecamSpeed) .. " u/s)"
+        freecamIndicator.Text = "🎥  FREECAM  ·  " .. math.floor(freecamSpeed) .. " u/s"
+    end
+end
+
+local function updatePlayersCount()
+    if playersCountLabel and playersCountLabel.Parent then
+        local count = 0
+        for _ in pairs(playerRows) do count = count + 1 end
+        playersCountLabel.Text = count .. " en ligne"
     end
 end
 
 local function applyFilter()
     if not searchBox or not searchBox.Parent then return end
-    local query = string.lower(searchBox.Text or "")
+    local q = string.lower(searchBox.Text or "")
     for player, data in pairs(playerRows) do
         if data.row and data.row.Parent then
             local hay = string.lower(player.DisplayName .. " " .. player.Name)
-            data.row.Visible = (query == "") or (string.find(hay, query, 1, true) ~= nil)
+            data.row.Visible = (q == "") or (string.find(hay, q, 1, true) ~= nil)
         end
     end
 end
 
-local function updateCanvasSize()
+-- ============================================================
+-- §7. TP
+-- ============================================================
+doTP = function(player)
+    if player == LocalPlayer then return end
+    local char = LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local tChar = player.Character
+    local tHRP  = tChar and tChar:FindFirstChild("HumanoidRootPart")
+    if not tHRP then return end
+
+    local before = hrp.Position
     pcall(function()
-        local abs = slLayout.AbsoluteContentSize
-        spectateList.CanvasSize = UDim2.new(0, 0, 0, abs.Y + 8)
+        hrp.CFrame = tHRP.CFrame * CFrame.new(0, 0, TP_OFFSET_STUDS)
+    end)
+
+    task.delay(0.3, function()
+        if hrp and hrp.Parent and (hrp.Position - before).Magnitude < 1 then
+            if spectateIndicator and spectateIndicator.Parent then
+                spectateIndicator.Text = "⚠  TP bloqué (anti-cheat ?)"
+                spectateIndicator.BackgroundColor3 = C_ORANGE
+                spectateIndicator.Visible = true
+                task.delay(2, function()
+                    if spectateIndicator and spectateIndicator.Parent
+                        and not spectateActive then
+                        spectateIndicator.Visible = false
+                        spectateIndicator.BackgroundColor3 = C_BLUE
+                    end
+                end)
+            end
+        end
     end)
 end
 
--- Met à jour le canvas dès que le layout change (plus fiable que AutomaticCanvasSize)
-track(slLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCanvasSize))
-
 -- ============================================================
--- ROW PLAYER
+-- §8. ROW PLAYER (design compact et moderne)
 -- ============================================================
 local function createRow(player)
     rowCounter = rowCounter + 1
     local row = Instance.new("Frame", spectateList)
-    row.Name = "P_" .. player.UserId
-    row.Size = UDim2.new(1, 0, 0, 58)
-    row.BackgroundColor3 = Color3.fromRGB(40, 43, 47)
+    row.Name = "R_" .. player.UserId
+    row.Size = UDim2.new(1, 0, 0, 56)
+    row.BackgroundColor3 = C_SURFACE_2
     row.BorderSizePixel = 0
     row.LayoutOrder = rowCounter
-    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
 
     local head = Instance.new("ImageLabel", row)
-    head.Size = UDim2.new(0, 50, 0, 50)
-    head.Position = UDim2.new(0, 4, 0.5, -25)
-    head.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    head.Size = UDim2.new(0, 44, 0, 44)
+    head.Position = UDim2.new(0, 6, 0.5, -22)
+    head.BackgroundColor3 = C_HOVER
     head.Image = getThumb(player)
-    Instance.new("UICorner", head).CornerRadius = UDim.new(0, 25)
+    Instance.new("UICorner", head).CornerRadius = UDim.new(0, 22)
 
+    -- Label nom (2 lignes : Display + @Name)
     local name = Instance.new("TextLabel", row)
-    name.Size = UDim2.new(1, -190, 0, 20)
-    name.Position = UDim2.new(0, 62, 0, 6)
+    name.Size = UDim2.new(1, -200, 0, 16)
+    name.Position = UDim2.new(0, 58, 0, 8)
     name.BackgroundTransparency = 1
-    name.Text = player.DisplayName .. " (@" .. player.Name .. ")"
-    name.TextColor3 = Color3.fromRGB(230, 230, 230)
-    name.Font = Enum.Font.Gotham
+    name.Text = player.DisplayName
+    name.TextColor3 = C_TEXT
+    name.Font = Enum.Font.GothamBold
     name.TextSize = 11
     name.TextXAlignment = Enum.TextXAlignment.Left
     name.TextTruncate = Enum.TextTruncate.AtEnd
 
+    local handle = Instance.new("TextLabel", row)
+    handle.Size = UDim2.new(1, -200, 0, 12)
+    handle.Position = UDim2.new(0, 58, 0, 26)
+    handle.BackgroundTransparency = 1
+    handle.Text = "@" .. player.Name
+    handle.TextColor3 = C_TEXT_MUTED
+    handle.Font = Enum.Font.Gotham
+    handle.TextSize = 9
+    handle.TextXAlignment = Enum.TextXAlignment.Left
+    handle.TextTruncate = Enum.TextTruncate.AtEnd
+
+    -- Bouton TP (icône compacte)
     local tpBtn = Instance.new("TextButton", row)
-    tpBtn.Size = UDim2.new(0, 46, 0, 24)
-    tpBtn.Position = UDim2.new(1, -128, 0, 28)
-    tpBtn.BackgroundColor3 = Color3.fromRGB(80, 130, 60)
-    tpBtn.Text = "TP"
+    tpBtn.Size = UDim2.new(0, 40, 0, 24)
+    tpBtn.Position = UDim2.new(1, -104, 0.5, -12)
+    tpBtn.BackgroundColor3 = C_ORANGE
+    tpBtn.Text = "⚡"
     tpBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
     tpBtn.Font = Enum.Font.GothamBold
-    tpBtn.TextSize = 10
-    Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0, 4)
+    tpBtn.TextSize = 13
+    Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0, 5)
+    applyHover(tpBtn, C_ORANGE, C_ORANGE_HOV)
 
-    local btn = Instance.new("TextButton", row)
-    btn.Size = UDim2.new(0, 72, 0, 24)
-    btn.Position = UDim2.new(1, -78, 0, 28)
-    btn.BackgroundColor3 = Color3.fromRGB(50, 100, 180)
-    btn.Text = "Spectate"
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Font = Enum.Font.Gotham
-    btn.TextSize = 10
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+    -- Bouton Spectate (icône compacte)
+    local specBtn = Instance.new("TextButton", row)
+    specBtn.Size = UDim2.new(0, 52, 0, 24)
+    specBtn.Position = UDim2.new(1, -60, 0.5, -12)
+    specBtn.BackgroundColor3 = C_BLUE
+    specBtn.Text = "👁"
+    specBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    specBtn.Font = Enum.Font.GothamBold
+    specBtn.TextSize = 13
+    Instance.new("UICorner", specBtn).CornerRadius = UDim.new(0, 5)
+    applyHover(specBtn, C_BLUE, C_BLUE_HOV)
 
     track(tpBtn.MouseButton1Click:Connect(function()
-        if player == LocalPlayer then return end
-        local char = LocalPlayer.Character
-        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-        if not hrp then return end
-        local tChar = player.Character
-        local tHRP  = tChar and tChar:FindFirstChild("HumanoidRootPart")
-        if not tHRP then return end
-        pcall(function()
-            hrp.CFrame = tHRP.CFrame * CFrame.new(0, 0, 3)
-        end)
+        if scriptDestroyed then return end
+        doTP(player)
+        flash(tpBtn, C_GREEN, 0.15)
     end))
 
-    track(btn.MouseButton1Click:Connect(function()
-        if startSpectate then startSpectate(player) end
+    track(specBtn.MouseButton1Click:Connect(function()
+        if scriptDestroyed then return end
+        startSpectate(player)
     end))
 
-    return { row = row, head = head }
+    return { row = row, head = head, specBtn = specBtn, tpBtn = tpBtn }
 end
 
 local function addPlayerRow(player)
@@ -450,26 +632,26 @@ local function addPlayerRow(player)
     end))
     applyFilter()
     updateCanvasSize()
+    updatePlayersCount()
 end
 
 local function removePlayerRow(player)
     local r = playerRows[player]
     if r then r.row:Destroy(); playerRows[player] = nil end
-    if spectateTarget == player and spectateActive and stopSpectate then
-        stopSpectate()
-    end
+    if spectateTarget == player and spectateActive then stopSpectate() end
     updateCanvasSize()
+    updatePlayersCount()
 end
 
 -- ============================================================
--- FREECAM
+-- §9. FREECAM
 -- ============================================================
-function enableFreecam()
+enableFreecam = function()
     if scriptDestroyed or freecamActive then return end
     local char, hum, hrp = getLocalCharacter()
     if not char or not hum or not hrp then return end
     if hum.Health <= 0 then return end
-    if spectateActive and stopSpectate then stopSpectate() end
+    if spectateActive then stopSpectate() end
 
     hrp.Anchored = true
     savedAutoRotate = hum.AutoRotate
@@ -488,14 +670,16 @@ function enableFreecam()
     freecamActive = true
     UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
 
-    freecamStatus.Text = "Status: ON"
+    freecamStatus.Text = "● Actif — WASD + souris"
+    freecamStatus.TextColor3 = C_GREEN
     freecamBtn.Text = "Disable Freecam"
-    freecamBtn.BackgroundColor3 = Color3.fromRGB(100, 50, 50)
+    TweenService:Create(freecamBtn, TweenInfo.new(0.2),
+        { BackgroundColor3 = C_GREEN }):Play()
     freecamIndicator.Visible = true
     updateSpeedDisplay()
 end
 
-function disableFreecam()
+disableFreecam = function()
     if not freecamActive then return end
     freecamActive = false
 
@@ -506,24 +690,24 @@ function disableFreecam()
         end
         if hum and hum.Parent then
             pcall(function() hum.AutoRotate = savedAutoRotate end)
-            if hum.Health > 0 then
-                Camera.CameraSubject = hum
-            end
+            if hum.Health > 0 then Camera.CameraSubject = hum end
         end
     end
 
     restoreCharacterVisibility()
-
     Camera.CameraType = Enum.CameraType.Custom
     pcall(function()
         if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
             UserInputService.MouseBehavior = Enum.MouseBehavior.Default
         end
     end)
+
     if not scriptDestroyed and freecamStatus and freecamStatus.Parent then
         freecamStatus.Text = "Status: OFF"
+        freecamStatus.TextColor3 = C_TEXT_MUTED
         freecamBtn.Text = "Enable Freecam"
-        freecamBtn.BackgroundColor3 = Color3.fromRGB(50, 55, 60)
+        TweenService:Create(freecamBtn, TweenInfo.new(0.2),
+            { BackgroundColor3 = C_SURFACE_2 }):Play()
         freecamIndicator.Visible = false
     end
 end
@@ -536,64 +720,64 @@ local function updateFreecam(dt)
         UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
     end
 
-    -- Réapplique la visibilité (Roblox peut la réinitialiser en 1ʳᵉ personne)
     for part, _ in pairs(savedTransparency) do
         if part and part.Parent and part:IsA("BasePart") then
             part.LocalTransparencyModifier = 0
         end
     end
 
-    local delta = UserInputService:GetMouseDelta()
-    freecamYaw   = freecamYaw   - delta.X * FREECAM_SENSITIVITY
-    freecamPitch = math.clamp(freecamPitch - delta.Y * FREECAM_SENSITIVITY,
+    local d = UserInputService:GetMouseDelta()
+    freecamYaw   = freecamYaw   - d.X * FREECAM_SENSITIVITY
+    freecamPitch = math.clamp(freecamPitch - d.Y * FREECAM_SENSITIVITY,
         -math.rad(89), math.rad(89))
 
     local rot = CFrame.fromEulerAnglesYXZ(freecamPitch, freecamYaw, 0)
 
-    local move = Vector3.new(0, 0, 0)
-    if isDown(Enum.KeyCode.W) then move = move + rot.LookVector  end
-    if isDown(Enum.KeyCode.S) then move = move - rot.LookVector  end
-    if isDown(Enum.KeyCode.D) then move = move + rot.RightVector end
-    if isDown(Enum.KeyCode.A) then move = move - rot.RightVector end
-    if isDown(Enum.KeyCode.E) or isDown(Enum.KeyCode.Space)     then
-        move = move + Vector3.new(0, 1, 0)
+    local move = Vector3.zero
+    if isDown(Enum.KeyCode.W) then move += rot.LookVector  end
+    if isDown(Enum.KeyCode.S) then move -= rot.LookVector  end
+    if isDown(Enum.KeyCode.D) then move += rot.RightVector end
+    if isDown(Enum.KeyCode.A) then move -= rot.RightVector end
+    if isDown(Enum.KeyCode.E) or isDown(Enum.KeyCode.Space) then
+        move += Vector3.yAxis
     end
     if isDown(Enum.KeyCode.Q) or isDown(Enum.KeyCode.LeftShift) then
-        move = move - Vector3.new(0, 1, 0)
+        move -= Vector3.yAxis
     end
     if move.Magnitude > 0 then move = move.Unit end
 
-    local speed = freecamSpeed
-    if isDown(Enum.KeyCode.LeftAlt)     then speed = speed * 3    end
-    if isDown(Enum.KeyCode.LeftControl) then speed = speed * 0.25 end
+    local spd = freecamSpeed
+    if isDown(Enum.KeyCode.LeftAlt)     then spd *= 3    end
+    if isDown(Enum.KeyCode.LeftControl) then spd *= 0.25 end
 
-    freecamPos = freecamPos + move * speed * dt
-    Camera.CFrame = CFrame.new(freecamPos) * rot
+    freecamPos += move * spd * dt
+    local cf = CFrame.new(freecamPos) * rot
+    Camera.CFrame = cf
+    Camera.Focus = cf
 end
 
 -- ============================================================
--- SPECTATE
+-- §10. SPECTATE
 -- ============================================================
 local function smoothed(alpha, dt)
     return 1 - (1 - alpha) ^ (dt * 60)
 end
 
-function updateSpectateCamera(dt)
+updateSpectateCamera = function(dt)
     if not spectateActive or not spectateTarget then return end
-
     if Camera.CameraType ~= Enum.CameraType.Scriptable then
         Camera.CameraType = Enum.CameraType.Scriptable
     end
 
-    local orbiting = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
-    if orbiting then
+    local orb = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+    if orb then
         if UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
             UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
         end
-        local delta = UserInputService:GetMouseDelta()
-        spectateYaw = spectateYaw - delta.X * SPECTATE_SENSITIVITY
+        local d = UserInputService:GetMouseDelta()
+        spectateYaw = spectateYaw - d.X * SPECTATE_SENSITIVITY
         spectateElevation = math.clamp(
-            spectateElevation - delta.Y * SPECTATE_SENSITIVITY,
+            spectateElevation - d.Y * SPECTATE_SENSITIVITY,
             -math.rad(89), math.rad(89))
     else
         if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
@@ -604,14 +788,14 @@ function updateSpectateCamera(dt)
     local char = spectateTarget.Character
     if not char then
         if spectateIndicator and spectateIndicator.Parent then
-            spectateIndicator.Text = "SPECTATE: " .. spectateTarget.DisplayName .. " (hors portée)"
+            spectateIndicator.Text = "👁  " .. spectateTarget.DisplayName .. " (hors portée)"
         end
         return
     end
     local hum = char:FindFirstChildOfClass("Humanoid")
     if hum and hum.Health <= 0 then
         if spectateIndicator and spectateIndicator.Parent then
-            spectateIndicator.Text = "SPECTATE: " .. spectateTarget.DisplayName .. " (cible morte)"
+            spectateIndicator.Text = "👁  " .. spectateTarget.DisplayName .. " (cible morte)"
         end
         return
     end
@@ -619,39 +803,33 @@ function updateSpectateCamera(dt)
     local anchor = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
     if not anchor then return end
 
-    local heightOffset = math.max(1, spectateDistance * 0.15)
-    local targetPos = anchor.Position + Vector3.new(0, heightOffset, 0)
+    local hOff = math.max(1, spectateDistance * 0.15)
+    local tPos = anchor.Position + Vector3.new(0, hOff, 0)
+    local rot  = CFrame.fromEulerAnglesYXZ(-spectateElevation, spectateYaw, 0)
+    local cPos = tPos + rot * Vector3.new(0, 0, spectateDistance)
+    local goal = CFrame.lookAt(cPos, tPos)
 
-    local rot = CFrame.fromEulerAnglesYXZ(-spectateElevation, spectateYaw, 0)
-    local camPos = targetPos + rot * Vector3.new(0, 0, spectateDistance)
-    local goalCF = CFrame.lookAt(camPos, targetPos)
+    if not currentOrbitCF then currentOrbitCF = goal
+    else currentOrbitCF = currentOrbitCF:Lerp(goal, smoothed(SPECTATE_SMOOTH, dt)) end
 
-    -- === FIX v9 : utilise currentOrbitCF persistante (pas Camera.CFrame) ===
-    -- Sinon, si le jeu reset Camera.CFrame entre 2 frames, le lerp ne
-    -- progresse jamais. Avec notre propre état, il progresse toujours.
-    if not currentOrbitCF then
-        currentOrbitCF = goalCF
-    else
-        currentOrbitCF = currentOrbitCF:Lerp(goalCF, smoothed(SPECTATE_SMOOTH, dt))
-    end
     Camera.CFrame = currentOrbitCF
+    Camera.Focus = currentOrbitCF
 
     if spectateIndicator and spectateIndicator.Parent then
-        local hint = orbiting and "relâche clic droit pour cliquer" or "clic droit = orbite"
-        spectateIndicator.Text = string.format(
-            "SPECTATE: %s  (dist %d)  — %s",
+        local hint = orb and "relâche = clic" or "clic droit = orbite"
+        spectateIndicator.Text = string.format("👁  %s  ·  %d studs  ·  %s",
             spectateTarget.DisplayName, math.floor(spectateDistance), hint)
     end
 end
 
-function startSpectate(player)
+startSpectate = function(player)
     if scriptDestroyed then return end
     if not player or player == LocalPlayer then return end
-    if freecamActive and disableFreecam then disableFreecam() end
+    if freecamActive then disableFreecam() end
 
     spectateTarget = player
     spectateActive = true
-    currentOrbitCF = nil   -- force le snap au premier frame
+    currentOrbitCF = nil
     Camera.CameraType = Enum.CameraType.Scriptable
     UserInputService.MouseBehavior = Enum.MouseBehavior.Default
     releaseTextFocus()
@@ -659,43 +837,56 @@ function startSpectate(player)
     local char = player.Character
     local anchor = char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
     if anchor then
-        local heightOffset = math.max(1, spectateDistance * 0.15)
-        local targetPos = anchor.Position + Vector3.new(0, heightOffset, 0)
-        local offset = Camera.CFrame.Position - targetPos
-        if offset.Magnitude > 0.5 then
-            local dir = offset.Unit
+        local hOff = math.max(1, spectateDistance * 0.15)
+        local tPos = anchor.Position + Vector3.new(0, hOff, 0)
+        local off  = Camera.CFrame.Position - tPos
+        if off.Magnitude > 0.5 then
+            local dir = off.Unit
             spectateElevation = math.asin(math.clamp(dir.Y, -1, 1))
             spectateYaw = math.atan2(dir.X, dir.Z)
-            spectateDistance = math.clamp(offset.Magnitude, SPECTATE_MIN_DIST, SPECTATE_MAX_DIST)
+            spectateDistance = math.clamp(off.Magnitude, SPECTATE_MIN_DIST, SPECTATE_MAX_DIST)
         else
-            spectateYaw = 0
-            spectateElevation = 0
+            spectateYaw = 0; spectateElevation = 0
         end
     else
-        spectateYaw = 0
-        spectateElevation = 0
+        spectateYaw = 0; spectateElevation = 0
     end
 
     spectateStopBtn.Visible = true
     spectateIndicator.Visible = true
     quickStopBtn.Visible = true
+
+    -- Feedback visuel sur la ligne ciblée
+    local r = playerRows[player]
+    if r and r.specBtn then
+        r.specBtn.BackgroundColor3 = C_RED
+        r.specBtn.Text = "⏹"
+    end
+
     updateSpectateCamera(1/60)
 end
 
-function stopSpectate()
+stopSpectate = function()
     if not spectateActive then return end
     local now = os.clock()
     if now - lastStopTime < STOP_DEBOUNCE then return end
     lastStopTime = now
+
+    -- Reset feedback ligne
+    if spectateTarget then
+        local r = playerRows[spectateTarget]
+        if r and r.specBtn and r.specBtn.Parent then
+            r.specBtn.BackgroundColor3 = C_BLUE
+            r.specBtn.Text = "👁"
+        end
+    end
 
     spectateActive = false
     spectateTarget = nil
     currentOrbitCF = nil
 
     local char, hum = getLocalCharacter()
-    if char and hum and hum.Health > 0 then
-        Camera.CameraSubject = hum
-    end
+    if char and hum and hum.Health > 0 then Camera.CameraSubject = hum end
     Camera.CameraType = Enum.CameraType.Custom
     pcall(function()
         if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
@@ -711,9 +902,10 @@ function stopSpectate()
 end
 
 -- ============================================================
--- BOUTONS GUI
+-- §11. BOUTONS / INPUTS
 -- ============================================================
 track(freecamBtn.MouseButton1Click:Connect(function()
+    if scriptDestroyed then return end
     if freecamActive then disableFreecam() else enableFreecam() end
 end))
 track(spectateStopBtn.MouseButton1Click:Connect(stopSpectate))
@@ -730,25 +922,20 @@ track(closeBtn.MouseButton1Click:Connect(function()
     if destroyScript then destroyScript() end
 end))
 
--- ============================================================
--- INPUTS CLAVIER
--- ============================================================
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if scriptDestroyed then return end
     if input.UserInputType == Enum.UserInputType.Keyboard then
         keysDown[input.KeyCode] = true
         if spectateActive and (input.KeyCode == Enum.KeyCode.Escape
             or input.KeyCode == Enum.KeyCode.Backspace) then
-            stopSpectate()
-            return
+            stopSpectate(); return
         end
     end
     if gameProcessed then return end
-
-    local key = input.KeyCode
-    if key == Enum.KeyCode.F then
+    local k = input.KeyCode
+    if k == Enum.KeyCode.F then
         if freecamActive then disableFreecam() else enableFreecam() end
-    elseif key == Enum.KeyCode.V then
+    elseif k == Enum.KeyCode.V then
         panel.Visible = not panel.Visible
     end
 end))
@@ -763,9 +950,6 @@ track(UserInputService.WindowFocusReleased:Connect(function()
     keysDown = {}
 end))
 
--- ============================================================
--- MOLETTE
--- ============================================================
 track(UserInputService.InputChanged:Connect(function(input)
     if scriptDestroyed then return end
     if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
@@ -779,21 +963,15 @@ track(UserInputService.InputChanged:Connect(function(input)
     end
 end))
 
--- ============================================================
--- RECHERCHE
--- ============================================================
 track(searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter))
 
 -- ============================================================
--- LISTE JOUEURS
+-- §12. LIFECYCLE JOUEURS
 -- ============================================================
 for _, p in ipairs(Players:GetPlayers()) do addPlayerRow(p) end
 track(Players.PlayerAdded:Connect(addPlayerRow))
 track(Players.PlayerRemoving:Connect(removePlayerRow))
 
--- ============================================================
--- RESPAWN / MORT
--- ============================================================
 local function watchCharacter(char)
     local hum = char:WaitForChild("Humanoid", 8)
     if not hum then return end
@@ -811,21 +989,20 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
 end))
 
 -- ============================================================
--- BOUCLE RENDU — priorité 2000 (Last) en valeur directe
+-- §13. BOUCLE RENDU
 -- ============================================================
-RunService:BindToRenderStep(RENDER_STEP_NAME, 2000, function(dt)
-    if scriptDestroyed then return end
-    if freecamActive then
-        updateFreecam(dt)
-    elseif spectateActive then
-        updateSpectateCamera(dt)
-    end
-end)
+RunService:BindToRenderStep(RENDER_STEP_NAME,
+    Enum.RenderPriority.Camera.Value + 1,
+    function(dt)
+        if scriptDestroyed then return end
+        if freecamActive then updateFreecam(dt)
+        elseif spectateActive then updateSpectateCamera(dt) end
+    end)
 
 -- ============================================================
--- FERMETURE PROPRE
+-- §14. DESTROY
 -- ============================================================
-function destroyScript()
+destroyScript = function()
     if scriptDestroyed then return end
     scriptDestroyed = true
 
@@ -836,9 +1013,7 @@ function destroyScript()
         local char, hum = getLocalCharacter()
         if char and hum and hum.Parent then
             hum.AutoRotate = savedAutoRotate
-            if hum.Health > 0 then
-                Camera.CameraSubject = hum
-            end
+            if hum.Health > 0 then Camera.CameraSubject = hum end
             Camera.CameraType = Enum.CameraType.Custom
         end
         if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
@@ -851,7 +1026,6 @@ function destroyScript()
         if hrp and hrp.Parent then hrp.Anchored = false end
     end)
     pcall(restoreCharacterVisibility)
-
     pcall(function() RunService:UnbindFromRenderStep(RENDER_STEP_NAME) end)
 
     for _, c in ipairs(connections) do
@@ -874,5 +1048,5 @@ function destroyScript()
     pcall(function() if screenGui then screenGui:Destroy() end end)
     screenGui = nil
 
-    print("[Freecam+Spectate] Script fermé proprement.")
+    print("[Camera Tools] Closed.")
 end
