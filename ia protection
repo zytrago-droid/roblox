@@ -1,0 +1,558 @@
+--[[
+    Hacking Everything: client-side anti-sit / anti-fling / anti-collision
+    target executor: Xeno (PC, AZERTY). toggle key: RightAlt.
+
+    sources:
+    - anti-sit:
+        myCompiler "Brookhaven script" (SetStateEnabled(Seated,false) + Sit loop)
+        ScriptBlox "Universal Script | Anti sit script" (Seat/VehicleSeat neutralise + Sit hook)
+    - anti-fling:
+        RedstoneAC (ScriptBlox) (velocity/spin clear, BodyMover purge)
+        DevForum "Cheaters throw players off the map" (HRP sanity check)
+    - anti-collision:
+        ScriptBlox "Universal Script | Noclip" (GetPropertyChangedSignal hook)
+        DevForum "Noclip Prevention" (server may reset CanCollide -> force back)
+
+    honest limits:
+    - server authority (Roblox 2026+) can roll back any client correction.
+    - server-side raycast between positions beats client noclip; you
+      cannot prevent a server rollback, only delay it locally.
+    - anti-fling cannot stop a teleport the server performs; it can only
+      put you back on the next tick.
+]]
+
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace       = game:GetService("Workspace")
+
+local player     = Players.LocalPlayer
+local playerGui  = player:WaitForChild("PlayerGui")
+
+local TOGGLE_KEY = Enum.KeyCode.RightAlt
+
+local function disconnectAll(list)
+    for i = #list, 1, -1 do
+        pcall(function() list[i]:Disconnect() end)
+        list[i] = nil
+    end
+end
+
+local function getCharacterParts()
+    local c = player.Character
+    if not c then return nil, nil, nil end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    local r = c:FindFirstChild("HumanoidRootPart")
+    return c, h, r
+end
+
+-- ============================================================
+-- MODULE 1: ANTI-SIT
+-- ============================================================
+local AntiSit = {
+    enabled = false,
+    token   = 0,
+    charConns = {},
+    descConn  = nil,
+    seatOriginals = {},
+}
+
+local function isSeat(inst)
+    return inst:IsA("Seat") or inst:IsA("VehicleSeat")
+end
+
+local function neutralizeSeat(seat)
+    if AntiSit.seatOriginals[seat] == nil then
+        AntiSit.seatOriginals[seat] = {
+            disabled  = seat.Disabled,
+            canTouch  = seat.CanTouch,
+        }
+    end
+    pcall(function() seat.Disabled = true  end)
+    pcall(function() seat.CanTouch = false end)
+end
+
+local function restoreSeat(seat)
+    local orig = AntiSit.seatOriginals[seat]
+    if not orig then return end
+    pcall(function() seat.Disabled = orig.disabled end)
+    pcall(function() seat.CanTouch = orig.canTouch end)
+    AntiSit.seatOriginals[seat] = nil
+end
+
+local function restoreAllSeats()
+    for seat in pairs(AntiSit.seatOriginals) do
+        if seat then restoreSeat(seat) end
+    end
+    AntiSit.seatOriginals = {}
+end
+
+local function bindAntiSit(c, h, r)
+    disconnectAll(AntiSit.charConns)
+    AntiSit.token = AntiSit.token + 1
+    local myToken = AntiSit.token
+    if not h then return end
+
+    pcall(function()
+        h:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+    end)
+
+    table.insert(AntiSit.charConns, h:GetPropertyChangedSignal("Sit"):Connect(function()
+        if not AntiSit.enabled then return end
+        if h.Sit then pcall(function() h.Sit = false end) end
+    end))
+
+    table.insert(AntiSit.charConns, h.StateChanged:Connect(function(_, new)
+        if not AntiSit.enabled then return end
+        if new == Enum.HumanoidStateType.Seated then
+            pcall(function() h:ChangeState(Enum.HumanoidStateType.Jumping) end)
+        end
+    end))
+
+    task.spawn(function()
+        while AntiSit.enabled and AntiSit.token == myToken do
+            if not h.Parent then break end
+            pcall(function() h.Sit = false end)
+            task.wait(0.05)
+        end
+    end)
+end
+
+local function enableAntiSit()
+    if AntiSit.enabled then return end
+    AntiSit.enabled = true
+
+    task.spawn(function()
+        for _, d in ipairs(Workspace:GetDescendants()) do
+            if isSeat(d) then neutralizeSeat(d) end
+        end
+    end)
+
+    if not AntiSit.descConn then
+        AntiSit.descConn = Workspace.DescendantAdded:Connect(function(d)
+            if not AntiSit.enabled then return end
+            if isSeat(d) then neutralizeSeat(d) end
+        end)
+    end
+
+    local c, h, r = getCharacterParts()
+    bindAntiSit(c, h, r)
+end
+
+local function disableAntiSit()
+    if not AntiSit.enabled then return end
+    AntiSit.enabled = false
+    AntiSit.token = AntiSit.token + 1
+    disconnectAll(AntiSit.charConns)
+
+    local _, h = getCharacterParts()
+    if h then
+        pcall(function()
+            h:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+        end)
+    end
+
+    if AntiSit.descConn then
+        AntiSit.descConn:Disconnect()
+        AntiSit.descConn = nil
+    end
+
+    restoreAllSeats()
+end
+
+-- ============================================================
+-- MODULE 2: ANTI-FLING
+-- ============================================================
+local AntiFling = {
+    enabled = false,
+    token   = 0,
+    charConns = {},
+    lastSafe  = nil,
+}
+
+local FLING_MAX_LIN        = 100
+local FLING_MAX_ANG        = 50
+local FLING_MAX_TELEPORT   = 50
+local FLING_MAX_FORCE      = 1e7
+
+local function isSuspectBodyMover(inst)
+    return inst:IsA("BodyVelocity")
+        or inst:IsA("BodyThrust")
+        or inst:IsA("BodyAngularVelocity")
+        or inst:IsA("BodyForce")
+        or inst:IsA("BodyPosition")
+        or inst:IsA("BodyGyro")
+end
+
+local function isSuspectConstraint(inst)
+    if inst:IsA("AlignPosition") or inst:IsA("LinearVelocity") then
+        local ok, mag = pcall(function() return inst.MaxForce.Magnitude end)
+        return ok and mag > FLING_MAX_FORCE
+    elseif inst:IsA("VectorForce") then
+        local ok, mag = pcall(function() return inst.Force.Magnitude end)
+        return ok and mag > FLING_MAX_FORCE
+    end
+    return false
+end
+
+local function purgeSuspicious(c)
+    if not c then return end
+    for _, inst in ipairs(c:GetDescendants()) do
+        if isSuspectBodyMover(inst) or isSuspectConstraint(inst) then
+            pcall(function() inst:Destroy() end)
+        end
+    end
+end
+
+local function startFlingWatch(c, h, r)
+    local myToken = AntiFling.token
+    task.spawn(function()
+        while AntiFling.enabled and AntiFling.token == myToken do
+            if not (r and r.Parent and h and h.Parent) then break end
+
+            pcall(function()
+                if r.AssemblyLinearVelocity.Magnitude > FLING_MAX_LIN then
+                    r.AssemblyLinearVelocity = Vector3.zero
+                end
+                if r.AssemblyAngularVelocity.Magnitude > FLING_MAX_ANG then
+                    r.AssemblyAngularVelocity = Vector3.zero
+                end
+
+                local pos = r.Position
+                local delta = (pos - AntiFling.lastSafe).Magnitude
+                if delta > FLING_MAX_TELEPORT then
+                    r.CFrame = CFrame.new(AntiFling.lastSafe + Vector3.new(0, 5, 0))
+                    r.AssemblyLinearVelocity = Vector3.zero
+                    r.AssemblyAngularVelocity = Vector3.zero
+                else
+                    AntiFling.lastSafe = pos
+                end
+            end)
+
+            purgeSuspicious(c)
+            task.wait(0.1)
+        end
+    end)
+end
+
+local function bindAntiFling(c, h, r)
+    disconnectAll(AntiFling.charConns)
+    AntiFling.token = AntiFling.token + 1
+    if not (c and r and h) then return end
+    AntiFling.lastSafe = r.Position
+
+    table.insert(AntiFling.charConns, c.ChildAdded:Connect(function(inst)
+        if not AntiFling.enabled then return end
+        if isSuspectBodyMover(inst) or isSuspectConstraint(inst) then
+            pcall(function() inst:Destroy() end)
+        end
+    end))
+
+    startFlingWatch(c, h, r)
+end
+
+local function enableAntiFling()
+    if AntiFling.enabled then return end
+    AntiFling.enabled = true
+    local c, h, r = getCharacterParts()
+    bindAntiFling(c, h, r)
+end
+
+local function disableAntiFling()
+    if not AntiFling.enabled then return end
+    AntiFling.enabled = false
+    AntiFling.token = AntiFling.token + 1
+    disconnectAll(AntiFling.charConns)
+    AntiFling.lastSafe = nil
+end
+
+-- ============================================================
+-- MODULE 3: ANTI-COLLISION (NOCLIP)
+-- ============================================================
+local AntiCollision = {
+    enabled   = false,
+    watchToken = 0,
+    charConns = {},
+    runConns  = {},
+    partConns = {},
+    originals = setmetatable({}, { __mode = "k" }),
+    locked    = setmetatable({}, { __mode = "k" }),
+}
+
+local function lockPart(part)
+    if not (part and part:IsA("BasePart")) then return end
+    if not AntiCollision.enabled then return end
+
+    if AntiCollision.originals[part] == nil then
+        AntiCollision.originals[part] = part.CanCollide
+    end
+    if part.CanCollide then
+        pcall(function() part.CanCollide = false end)
+    end
+    if AntiCollision.locked[part] then return end
+    AntiCollision.locked[part] = true
+
+    local ok, conn = pcall(function()
+        return part:GetPropertyChangedSignal("CanCollide"):Connect(function()
+            if not AntiCollision.enabled then return end
+            if part.CanCollide then
+                pcall(function() part.CanCollide = false end)
+            end
+        end)
+    end)
+    if ok and conn then
+        table.insert(AntiCollision.partConns, conn)
+    end
+end
+
+local function sweepCharacter()
+    if not AntiCollision.enabled then return end
+    local c = player.Character
+    if not c then return end
+    for _, d in ipairs(c:GetDescendants()) do
+        if d:IsA("BasePart") then lockPart(d) end
+    end
+end
+
+local function bindAntiCollision(c)
+    disconnectAll(AntiCollision.charConns)
+    for _, conn in ipairs(AntiCollision.partConns) do
+        pcall(function() conn:Disconnect() end)
+    end
+    AntiCollision.partConns = {}
+    AntiCollision.originals = setmetatable({}, { __mode = "k" })
+    AntiCollision.locked    = setmetatable({}, { __mode = "k" })
+
+    if not c then return end
+    table.insert(AntiCollision.charConns, c.DescendantAdded:Connect(function(d)
+        if not AntiCollision.enabled then return end
+        if d:IsA("BasePart") then lockPart(d) end
+    end))
+    sweepCharacter()
+end
+
+local function enableAntiCollision()
+    if AntiCollision.enabled then return end
+    AntiCollision.enabled = true
+    AntiCollision.watchToken = AntiCollision.watchToken + 1
+    local myToken = AntiCollision.watchToken
+
+    table.insert(AntiCollision.runConns, RunService.Stepped:Connect(sweepCharacter))
+    table.insert(AntiCollision.runConns, RunService.Heartbeat:Connect(sweepCharacter))
+    table.insert(AntiCollision.runConns, RunService.RenderStepped:Connect(sweepCharacter))
+
+    task.spawn(function()
+        while AntiCollision.enabled and AntiCollision.watchToken == myToken do
+            pcall(sweepCharacter)
+            task.wait(0.25)
+        end
+    end)
+
+    bindAntiCollision(player.Character)
+end
+
+local function disableAntiCollision()
+    if not AntiCollision.enabled then return end
+    AntiCollision.enabled = false
+    AntiCollision.watchToken = AntiCollision.watchToken + 1
+    disconnectAll(AntiCollision.runConns)
+    disconnectAll(AntiCollision.charConns)
+
+    for _, conn in ipairs(AntiCollision.partConns) do
+        pcall(function() conn:Disconnect() end)
+    end
+    AntiCollision.partConns = {}
+
+    for part, orig in pairs(AntiCollision.originals) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = orig end)
+        end
+    end
+    AntiCollision.originals = setmetatable({}, { __mode = "k" })
+    AntiCollision.locked    = setmetatable({}, { __mode = "k" })
+end
+
+-- ============================================================
+-- RESPAWN HANDLING
+-- ============================================================
+player.CharacterAdded:Connect(function(c)
+    local h = c:WaitForChild("Humanoid", 5)
+    local r = c:WaitForChild("HumanoidRootPart", 5)
+    if not h or not r then return end
+    if AntiSit.enabled       then bindAntiSit(c, h, r) end
+    if AntiFling.enabled     then bindAntiFling(c, h, r) end
+    if AntiCollision.enabled then bindAntiCollision(c) end
+end)
+
+-- ============================================================
+-- GUI
+-- ============================================================
+local gui = Instance.new("ScreenGui")
+gui.Name             = "HE_AntiX"
+gui.ResetOnSpawn     = false
+gui.IgnoreGuiInset   = true
+gui.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder     = 999
+gui.Parent           = playerGui
+
+local main = Instance.new("Frame")
+main.Size             = UDim2.new(0, 220, 0, 180)
+main.Position         = UDim2.new(0.5, -110, 0.2, 0)
+main.BackgroundColor3 = Color3.fromRGB(30, 32, 35)
+main.BorderSizePixel  = 0
+main.Parent           = gui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 8)
+mainCorner.Parent = main
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color     = Color3.fromRGB(60, 63, 68)
+mainStroke.Thickness = 1
+mainStroke.Parent    = main
+
+local uiScale = Instance.new("UIScale")
+uiScale.Scale  = 1
+uiScale.Parent = main
+
+local header = Instance.new("Frame")
+header.Size               = UDim2.new(1, 0, 0, 28)
+header.BackgroundTransparency = 1
+header.Parent             = main
+
+local title = Instance.new("TextLabel")
+title.Size               = UDim2.new(1, -16, 1, 0)
+title.Position           = UDim2.new(0, 12, 0, 0)
+title.BackgroundTransparency = 1
+title.Font               = Enum.Font.GothamMedium
+title.TextSize           = 13
+title.TextColor3         = Color3.fromRGB(230, 230, 230)
+title.TextXAlignment     = Enum.TextXAlignment.Left
+title.Text               = "client modules"
+title.Parent             = header
+
+-- drag
+local dragging, dragStart, startPos
+header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging   = true
+        dragStart  = input.Position
+        startPos   = main.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+-- ctrl + wheel to resize
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+    local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+              or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+    if not ctrl then return end
+    uiScale.Scale = math.clamp(uiScale.Scale + input.Position.Z * 0.05, 0.5, 2.5)
+end)
+
+-- toggles
+local function makeToggle(order, labelText, getState, setState)
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(1, -16, 0, 32)
+    btn.Position         = UDim2.new(0, 8, 0, 34 + (order - 1) * 38)
+    btn.BackgroundColor3 = Color3.fromRGB(45, 48, 52)
+    btn.BorderSizePixel  = 0
+    btn.AutoButtonColor  = false
+    btn.Text             = ""
+    btn.Parent           = main
+
+    local cr = Instance.new("UICorner")
+    cr.CornerRadius = UDim.new(0, 6)
+    cr.Parent = btn
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size               = UDim2.new(1, -80, 1, 0)
+    lbl.Position           = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font               = Enum.Font.GothamMedium
+    lbl.TextSize           = 12
+    lbl.TextColor3         = Color3.fromRGB(220, 220, 220)
+    lbl.TextXAlignment     = Enum.TextXAlignment.Left
+    lbl.Text               = labelText
+    lbl.Parent             = btn
+
+    local state = Instance.new("TextLabel")
+    state.Size               = UDim2.new(0, 60, 1, 0)
+    state.Position           = UDim2.new(1, -72, 0, 0)
+    state.BackgroundTransparency = 1
+    state.Font               = Enum.Font.GothamBold
+    state.TextSize           = 12
+    state.TextXAlignment     = Enum.TextXAlignment.Right
+    state.Parent             = btn
+
+    local function refresh()
+        if getState() then
+            state.Text       = "ON"
+            state.TextColor3 = Color3.fromRGB(80, 200, 120)
+        else
+            state.Text       = "OFF"
+            state.TextColor3 = Color3.fromRGB(120, 120, 120)
+        end
+    end
+    refresh()
+
+    btn.MouseButton1Click:Connect(function()
+        setState(not getState())
+        refresh()
+    end)
+
+    return btn
+end
+
+makeToggle(
+    1, "Anti-Sit",
+    function() return AntiSit.enabled end,
+    function(v) if v then enableAntiSit() else disableAntiSit() end end
+)
+makeToggle(
+    2, "Anti-Fling",
+    function() return AntiFling.enabled end,
+    function(v) if v then enableAntiFling() else disableAntiFling() end end
+)
+makeToggle(
+    3, "Anti-Collision",
+    function() return AntiCollision.enabled end,
+    function(v) if v then enableAntiCollision() else disableAntiCollision() end end
+)
+
+local footer = Instance.new("TextLabel")
+footer.Size               = UDim2.new(1, -16, 0, 20)
+footer.Position           = UDim2.new(0, 8, 1, -28)
+footer.BackgroundTransparency = 1
+footer.Font               = Enum.Font.Gotham
+footer.TextSize           = 11
+footer.TextColor3         = Color3.fromRGB(140, 140, 140)
+footer.TextXAlignment     = Enum.TextXAlignment.Left
+footer.Text               = "RightAlt = toggle GUI   (Ctrl+wheel = resize)"
+footer.Parent             = main
+
+-- hotkey
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == TOGGLE_KEY then
+        gui.Enabled = not gui.Enabled
+    end
+end)
