@@ -1,0 +1,824 @@
+--!strict
+--[[
+    SPINBOT MODERNE v3.0 — Xeno PC AZERTY
+    ============================================================
+    Nouveautés v3.0 :
+      ★ STABILISATEUR UPRIGHT : le personnage ne tombe plus
+        jamais, même en tournant (correction Heartbeat + forçage
+        d'état humanoid + préservation des vélocités)
+      ★ GUI déplaçable UNIQUEMENT par le header
+        (drag manuel avec détection de zone, closeBtn à part)
+      ★ Tout reste propre à la fermeture (fullCleanup)
+    ============================================================
+    Correctifs rappelés depuis v2.0 :
+      - humanoid.AutoRotate = false pendant le spin
+      - États FallingDown / Ragdoll / GettingUp désactivés
+      - Plafond vitesse angulaire APPLIQUÉE (300 rad/s)
+      - Anti-fling renforcé (30 studs/s à haute vitesse)
+      - AssemblyAngularVelocity toujours sur axe Y pur
+    ============================================================
+    Keybind : RightShift (fallback RightControl)
+    Redimensionnement : Ctrl + molette
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ============================================================
+-- PALETTE
+-- ============================================================
+local C = {
+    bg          = Color3.fromRGB(24, 24, 37),
+    bgHover     = Color3.fromRGB(38, 38, 58),
+    bgActive    = Color3.fromRGB(48, 48, 70),
+    bgSlider    = Color3.fromRGB(40, 40, 60),
+    accent      = Color3.fromRGB(139, 92, 246),
+    accentHover = Color3.fromRGB(159, 112, 255),
+    success     = Color3.fromRGB(34, 197, 94),
+    danger      = Color3.fromRGB(239, 68, 68),
+    text        = Color3.fromRGB(237, 237, 245),
+    textDim     = Color3.fromRGB(148, 155, 165),
+    stroke      = Color3.fromRGB(60, 60, 85),
+}
+
+-- ============================================================
+-- ÉTAT
+-- ============================================================
+local Spinbot = {
+    enabled    = false,
+    speed      = 45,
+    method     = 1,
+    connection = nil,
+    constraint = nil,
+    attachment = nil,
+}
+
+local MIN_SPEED, MAX_SPEED  = 10, 500
+local MAX_HORIZONTAL_SPEED  = 60
+local MAX_SAFE_SPIN         = 300
+
+local originalPhysProps = {}
+local clampConn        = nil
+local uprightConn      = nil
+local allConnections   = {}
+local gui              = nil
+local isShutdown       = false
+
+local function bind(conn)
+    table.insert(allConnections, conn)
+    return conn
+end
+
+-- ============================================================
+-- UTILITAIRES
+-- ============================================================
+local function getRootAndHumanoid()
+    local char = LocalPlayer.Character
+    if not char then return nil, nil end
+    return char:FindFirstChild("HumanoidRootPart"),
+           char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getAppliedSpeed()
+    return math.min(Spinbot.speed, MAX_SAFE_SPIN)
+end
+
+-- ============================================================
+-- ANTI-FLING : propriétés physiques
+-- ============================================================
+local function applyNoFlingProperties()
+    originalPhysProps = {}
+    local char = LocalPlayer.Character
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            pcall(function()
+                originalPhysProps[part] = part.CustomPhysicalProperties
+                part.CustomPhysicalProperties =
+                    PhysicalProperties.new(0.7, 0, 0, 100, 100)
+            end)
+        end
+    end
+end
+
+local function restorePhysProperties()
+    for part, props in pairs(originalPhysProps) do
+        pcall(function()
+            if part and part.Parent then
+                part.CustomPhysicalProperties = props
+            end
+        end)
+    end
+    originalPhysProps = {}
+end
+
+-- ============================================================
+-- ANTI-FLING : clamp vélocité horizontale
+-- ============================================================
+local function startVelocityClamp()
+    if clampConn then clampConn:Disconnect() end
+    clampConn = RunService.Heartbeat:Connect(function()
+        if not Spinbot.enabled then return end
+        local hrp = getRootAndHumanoid()
+        if not hrp then return end
+        local v  = hrp.AssemblyLinearVelocity
+        local hv = Vector3.new(v.X, 0, v.Z)
+        local limit = (Spinbot.speed > 100) and 30 or MAX_HORIZONTAL_SPEED
+        if hv.Magnitude > limit then
+            pcall(function()
+                local clamped = hv.Unit * limit
+                hrp.AssemblyLinearVelocity =
+                    Vector3.new(clamped.X, v.Y, clamped.Z)
+            end)
+        end
+    end)
+end
+
+local function stopVelocityClamp()
+    if clampConn then
+        clampConn:Disconnect()
+        clampConn = nil
+    end
+end
+
+-- ============================================================
+-- STABILISATEUR UPRIGHT — "jamais tomber"
+-- ============================================================
+-- 1) Force l'humanoid hors des états de chute / ragdoll
+-- 2) Corrige la CFrame si l'up vector dévie (roulis/tangage)
+-- 3) Préserve les vélocités pour ne pas interférer avec le spin
+local function startUprightStabilizer()
+    if uprightConn then uprightConn:Disconnect() end
+    uprightConn = RunService.Heartbeat:Connect(function()
+        if not Spinbot.enabled then return end
+        local hrp, hum = getRootAndHumanoid()
+        if not hrp or not hum then return end
+
+        -- A. Sortie forcée des états "au sol"
+        local state = hum:GetState()
+        if state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.Ragdoll
+        or state == Enum.HumanoidStateType.GettingUp then
+            pcall(function()
+                hum:ChangeState(Enum.HumanoidStateType.Running)
+            end)
+        end
+
+        -- B. Correction d'orientation
+        local cf = hrp.CFrame
+        if cf.UpVector.Y < 0.995 then
+            local av = hrp.AssemblyAngularVelocity
+            local lv = hrp.AssemblyLinearVelocity
+            local pos = cf.Position
+            local look = cf.LookVector
+            local flat = Vector3.new(look.X, 0, look.Z)
+            if flat.Magnitude < 0.01 then
+                flat = Vector3.new(0, 0, -1)
+            else
+                flat = flat.Unit
+            end
+            pcall(function()
+                hrp.CFrame = CFrame.lookAt(pos, pos + flat, Vector3.yAxis)
+                hrp.AssemblyAngularVelocity = av
+                hrp.AssemblyLinearVelocity = lv
+            end)
+        end
+    end)
+end
+
+local function stopUprightStabilizer()
+    if uprightConn then
+        uprightConn:Disconnect()
+        uprightConn = nil
+    end
+end
+
+-- ============================================================
+-- FIX humanoid (états + AutoRotate)
+-- ============================================================
+local function applySpinGroundFix()
+    local _, hum = getRootAndHumanoid()
+    if not hum then return end
+    pcall(function()
+        hum.AutoRotate = false
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+    end)
+end
+
+local function restoreSpinGroundFix()
+    local _, hum = getRootAndHumanoid()
+    if not hum then return end
+    pcall(function()
+        hum.AutoRotate = true
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+        hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+    end)
+end
+
+-- ============================================================
+-- MÉTHODES DE SPIN
+-- ============================================================
+local function startMethod1(hrp)
+    if Spinbot.connection then Spinbot.connection:Disconnect() end
+    Spinbot.connection = RunService.RenderStepped:Connect(function()
+        if not Spinbot.enabled then return end
+        local char = LocalPlayer.Character
+        if not char then return end
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+        pcall(function()
+            root.AssemblyAngularVelocity = Vector3.new(0, getAppliedSpeed(), 0)
+        end)
+    end)
+end
+
+local function stopMethod1()
+    if Spinbot.connection then
+        Spinbot.connection:Disconnect()
+        Spinbot.connection = nil
+    end
+end
+
+local function stopMethod2()
+    if Spinbot.constraint then
+        pcall(function() Spinbot.constraint:Destroy() end)
+        Spinbot.constraint = nil
+    end
+    if Spinbot.attachment then
+        pcall(function() Spinbot.attachment:Destroy() end)
+        Spinbot.attachment = nil
+    end
+end
+
+local function startMethod2(hrp)
+    stopMethod2()
+    local att = Instance.new("Attachment")
+    att.Name = "SpinbotAttachment"
+    att.Parent = hrp
+    local av = Instance.new("AngularVelocity")
+    av.Name = "SpinbotAngularVelocity"
+    av.Attachment0 = att
+    av.MaxTorque = math.huge
+    av.AngularVelocity = Vector3.new(0, getAppliedSpeed(), 0)
+    av.RelativeTo = Enum.ActuatorRelativeTo.World
+    av.Parent = hrp
+    Spinbot.attachment = att
+    Spinbot.constraint = av
+end
+
+-- ============================================================
+-- STATUS
+-- ============================================================
+local function setStatus(text, color)
+    if not gui then return end
+    gui.statusLabel.Text = text
+    gui.statusLabel.TextColor3 = color or C.textDim
+    gui.statusDot.BackgroundColor3 = color or C.textDim
+end
+
+-- ============================================================
+-- ACTIVATION / DÉSACTIVATION
+-- ============================================================
+local function applySpinbot()
+    local hrp = getRootAndHumanoid()
+    if not hrp then
+        setStatus("fail: no character", C.danger)
+        Spinbot.enabled = false
+        if gui then
+            gui.toggleBtn.Text = "SPINBOT OFF"
+            TweenService:Create(gui.toggleBtn, TweenInfo.new(0.2),
+                { BackgroundColor3 = C.bgActive }):Play()
+        end
+        return
+    end
+    stopMethod1()
+    stopMethod2()
+    if Spinbot.method == 1 then
+        startMethod1(hrp)
+    else
+        startMethod2(hrp)
+    end
+    applyNoFlingProperties()
+    startVelocityClamp()
+    applySpinGroundFix()
+    startUprightStabilizer()
+    setStatus("spinning · debout", C.success)
+end
+
+local function disableSpinbot()
+    Spinbot.enabled = false
+    stopMethod1()
+    stopMethod2()
+    stopVelocityClamp()
+    stopUprightStabilizer()
+    restorePhysProperties()
+    restoreSpinGroundFix()
+    setStatus("ready", C.textDim)
+end
+
+local function toggleSpinbot()
+    Spinbot.enabled = not Spinbot.enabled
+    if gui then
+        TweenService:Create(gui.toggleBtn, TweenInfo.new(0.2), {
+            BackgroundColor3 = Spinbot.enabled and C.accent or C.bgActive
+        }):Play()
+        gui.toggleBtn.Text = Spinbot.enabled and "SPINBOT ON" or "SPINBOT OFF"
+    end
+    if Spinbot.enabled then
+        applySpinbot()
+    else
+        disableSpinbot()
+    end
+end
+
+-- ============================================================
+-- SHUTDOWN COMPLET
+-- ============================================================
+local function fullCleanup()
+    if isShutdown then return end
+    isShutdown = true
+    Spinbot.enabled = false
+
+    if Spinbot.connection then
+        pcall(function() Spinbot.connection:Disconnect() end)
+        Spinbot.connection = nil
+    end
+    stopMethod2()
+    stopVelocityClamp()
+    stopUprightStabilizer()
+    restorePhysProperties()
+    restoreSpinGroundFix()
+
+    for _, conn in ipairs(allConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    allConnections = {}
+
+    if gui and gui.screenGui then
+        pcall(function() gui.screenGui:Destroy() end)
+        gui = nil
+    end
+
+    print("[Spinbot] Shutdown complet.")
+end
+
+-- ============================================================
+-- GUI
+-- ============================================================
+local function createGUI()
+    local old = PlayerGui:FindFirstChild("SpinbotGUI")
+    if old then old:Destroy() end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "SpinbotGUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder = 999
+    screenGui.Parent = PlayerGui
+
+    -- Conteneur principal (PAS Draggable — drag manuel sur header)
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.new(0, 300, 0, 350)
+    main.Position = UDim2.new(0.5, -150, 0.5, -175)
+    main.BackgroundColor3 = C.bg
+    main.BorderSizePixel = 0
+    main.Active = false
+    main.Draggable = false
+    main.ClipsDescendants = true
+    main.Parent = screenGui
+
+    Instance.new("UICorner", main).CornerRadius = UDim.new(0, 14)
+
+    local mainStroke = Instance.new("UIStroke", main)
+    mainStroke.Color = C.stroke
+    mainStroke.Thickness = 1
+
+    local uiScale = Instance.new("UIScale", main)
+    uiScale.Scale = 1
+
+    -- ===== HEADER (zone de drag uniquement) =====
+    local header = Instance.new("Frame")
+    header.Name = "Header"
+    header.Size = UDim2.new(1, 0, 0, 54)
+    header.BackgroundColor3 = C.bg
+    header.BorderSizePixel = 0
+    header.Active = false
+    header.Parent = main
+    Instance.new("UICorner", header).CornerRadius = UDim.new(0, 14)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -60, 0, 24)
+    title.Position = UDim2.new(0, 16, 0, 10)
+    title.BackgroundTransparency = 1
+    title.Text = "Spinbot"
+    title.TextColor3 = C.text
+    title.TextSize = 18
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = header
+
+    local subtitle = Instance.new("TextLabel")
+    subtitle.Size = UDim2.new(1, -60, 0, 14)
+    subtitle.Position = UDim2.new(0, 16, 0, 32)
+    subtitle.BackgroundTransparency = 1
+    subtitle.Text = "v3.0 · anti-fling · upright"
+    subtitle.TextColor3 = C.textDim
+    subtitle.TextSize = 11
+    subtitle.Font = Enum.Font.Gotham
+    subtitle.TextXAlignment = Enum.TextXAlignment.Left
+    subtitle.Parent = header
+
+    local accentLine = Instance.new("Frame")
+    accentLine.Size = UDim2.new(0, 36, 0, 2)
+    accentLine.Position = UDim2.new(0, 16, 0, 49)
+    accentLine.BackgroundColor3 = C.accent
+    accentLine.BorderSizePixel = 0
+    accentLine.Parent = header
+    Instance.new("UICorner", accentLine).CornerRadius = UDim.new(1, 0)
+
+    -- ===== BOUTON FERMER (sibling du header, au-dessus) =====
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Name = "CloseBtn"
+    closeBtn.Size = UDim2.new(0, 28, 0, 28)
+    closeBtn.Position = UDim2.new(1, -38, 0, 13)
+    closeBtn.BackgroundColor3 = C.bgActive
+    closeBtn.Text = "✕"
+    closeBtn.TextColor3 = C.textDim
+    closeBtn.TextSize = 14
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.BorderSizePixel = 0
+    closeBtn.ZIndex = 5
+    closeBtn.Parent = main  -- ← sibling du header, pas enfant !
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
+
+    -- ===== CONTENU =====
+    local content = Instance.new("Frame")
+    content.Name = "Content"
+    content.Size = UDim2.new(1, -32, 1, -70)
+    content.Position = UDim2.new(0, 16, 0, 62)
+    content.BackgroundTransparency = 1
+    content.Parent = main
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 12)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = content
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(1, 0, 0, 48)
+    toggleBtn.BackgroundColor3 = C.bgActive
+    toggleBtn.Text = "SPINBOT OFF"
+    toggleBtn.TextColor3 = C.text
+    toggleBtn.TextSize = 14
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.LayoutOrder = 1
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.Parent = content
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 10)
+
+    local speedHeader = Instance.new("Frame")
+    speedHeader.Size = UDim2.new(1, 0, 0, 16)
+    speedHeader.BackgroundTransparency = 1
+    speedHeader.LayoutOrder = 2
+    speedHeader.Parent = content
+
+    local speedLabel = Instance.new("TextLabel")
+    speedLabel.Size = UDim2.new(0.5, 0, 1, 0)
+    speedLabel.BackgroundTransparency = 1
+    speedLabel.Text = "SPEED"
+    speedLabel.TextColor3 = C.textDim
+    speedLabel.TextSize = 10
+    speedLabel.Font = Enum.Font.GothamBold
+    speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+    speedLabel.Parent = speedHeader
+
+    local speedValue = Instance.new("TextLabel")
+    speedValue.Size = UDim2.new(0.5, 0, 1, 0)
+    speedValue.Position = UDim2.new(0.5, 0, 0, 0)
+    speedValue.BackgroundTransparency = 1
+    speedValue.Text = "45 rad/s"
+    speedValue.TextColor3 = C.accent
+    speedValue.TextSize = 11
+    speedValue.Font = Enum.Font.GothamBold
+    speedValue.TextXAlignment = Enum.TextXAlignment.Right
+    speedValue.Parent = speedHeader
+
+    local slider = Instance.new("Frame")
+    slider.Size = UDim2.new(1, 0, 0, 20)
+    slider.BackgroundTransparency = 1
+    slider.LayoutOrder = 3
+    slider.Parent = content
+
+    local trackBar = Instance.new("Frame")
+    trackBar.Size = UDim2.new(1, 0, 0, 8)
+    trackBar.Position = UDim2.new(0, 0, 0.5, -4)
+    trackBar.BackgroundColor3 = C.bgSlider
+    trackBar.BorderSizePixel = 0
+    trackBar.Parent = slider
+    Instance.new("UICorner", trackBar).CornerRadius = UDim.new(1, 0)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BackgroundColor3 = C.accent
+    fill.BorderSizePixel = 0
+    fill.Parent = trackBar
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 18, 0, 18)
+    knob.Position = UDim2.new(0, -9, 0.5, -9)
+    knob.BackgroundColor3 = C.text
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 3
+    knob.Parent = trackBar
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local methodBtn = Instance.new("TextButton")
+    methodBtn.Size = UDim2.new(1, 0, 0, 40)
+    methodBtn.BackgroundColor3 = C.bgActive
+    methodBtn.Text = "AssemblyAngularVelocity"
+    methodBtn.TextColor3 = C.text
+    methodBtn.TextSize = 12
+    methodBtn.Font = Enum.Font.Gotham
+    methodBtn.BorderSizePixel = 0
+    methodBtn.LayoutOrder = 4
+    methodBtn.AutoButtonColor = false
+    methodBtn.Parent = content
+    Instance.new("UICorner", methodBtn).CornerRadius = UDim.new(0, 10)
+
+    local statusFrame = Instance.new("Frame")
+    statusFrame.Size = UDim2.new(1, 0, 0, 22)
+    statusFrame.BackgroundColor3 = C.bgActive
+    statusFrame.BorderSizePixel = 0
+    statusFrame.LayoutOrder = 5
+    statusFrame.Parent = content
+    Instance.new("UICorner", statusFrame).CornerRadius = UDim.new(0, 6)
+
+    local statusDot = Instance.new("Frame")
+    statusDot.Size = UDim2.new(0, 6, 0, 6)
+    statusDot.Position = UDim2.new(0, 10, 0.5, -3)
+    statusDot.BackgroundColor3 = C.textDim
+    statusDot.BorderSizePixel = 0
+    statusDot.Parent = statusFrame
+    Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
+
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -26, 1, 0)
+    statusLabel.Position = UDim2.new(0, 24, 0, 0)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = "ready"
+    statusLabel.TextColor3 = C.textDim
+    statusLabel.TextSize = 11
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Parent = statusFrame
+
+    return {
+        screenGui   = screenGui,
+        main        = main,
+        header      = header,
+        uiScale     = uiScale,
+        closeBtn    = closeBtn,
+        toggleBtn   = toggleBtn,
+        speedValue  = speedValue,
+        trackBar    = trackBar,
+        fill        = fill,
+        knob        = knob,
+        methodBtn   = methodBtn,
+        statusLabel = statusLabel,
+        statusDot   = statusDot,
+    }
+end
+
+gui = createGUI()
+
+-- ============================================================
+-- DRAG UNIQUEMENT PAR LE HEADER
+-- ============================================================
+-- On détecte si le clic initial est sur le closeBtn ; si oui,
+-- on n'initialise pas le drag. Sinon, drag actif.
+local function pointOverGuiObject(obj, screenPos)
+    local ap = obj.AbsolutePosition
+    local as = obj.AbsoluteSize
+    return screenPos.X >= ap.X and screenPos.X <= ap.X + as.X
+       and screenPos.Y >= ap.Y and screenPos.Y <= ap.Y + as.Y
+end
+
+local isDragging    = false
+local dragStartPos  = Vector2.new(0, 0)
+local dragStartMain = UDim2.new(0, 0, 0, 0)
+local dragMoveConn  = nil
+local dragEndConn   = nil
+
+local function stopDrag()
+    isDragging = false
+    if dragMoveConn then dragMoveConn:Disconnect(); dragMoveConn = nil end
+    if dragEndConn  then dragEndConn:Disconnect();  dragEndConn  = nil  end
+end
+
+bind(gui.header.InputBegan:Connect(function(input)
+    if isShutdown then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+    and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    -- Empêche le drag si le clic est sur le bouton fermer
+    local sp = Vector2.new(input.Position.X, input.Position.Y)
+    if pointOverGuiObject(gui.closeBtn, sp) then return end
+
+    isDragging    = true
+    dragStartPos  = Vector2.new(input.Position.X, input.Position.Y)
+    dragStartMain = gui.main.Position
+
+    dragMoveConn = UserInputService.InputChanged:Connect(function(changed)
+        if not isDragging or not gui then return end
+        if changed.UserInputType ~= Enum.UserInputType.MouseMovement
+        and changed.UserInputType ~= Enum.UserInputType.Touch then return end
+        local delta = Vector2.new(changed.Position.X, changed.Position.Y) - dragStartPos
+        gui.main.Position = UDim2.new(
+            dragStartMain.X.Scale, dragStartMain.X.Offset + delta.X,
+            dragStartMain.Y.Scale, dragStartMain.Y.Offset + delta.Y
+        )
+    end)
+
+    dragEndConn = UserInputService.InputEnded:Connect(function(ended)
+        if ended.UserInputType == Enum.UserInputType.MouseButton1
+        or ended.UserInputType == Enum.UserInputType.Touch then
+            stopDrag()
+        end
+    end)
+end))
+
+-- ============================================================
+-- SLIDER
+-- ============================================================
+local function updateSpeedDisplay(value)
+    local speed = math.floor(MIN_SPEED + (MAX_SPEED - MIN_SPEED) * value)
+    Spinbot.speed = speed
+    if speed > MAX_SAFE_SPIN then
+        gui.speedValue.Text = ("%d rad/s (appliqué: %d)"):format(speed, MAX_SAFE_SPIN)
+        gui.speedValue.TextColor3 = C.danger
+    else
+        gui.speedValue.Text = ("%d rad/s"):format(speed)
+        gui.speedValue.TextColor3 = C.accent
+    end
+    gui.fill.Size = UDim2.new(value, 0, 1, 0)
+    gui.knob.Position = UDim2.new(value, -9, 0.5, -9)
+end
+
+updateSpeedDisplay((45 - MIN_SPEED) / (MAX_SPEED - MIN_SPEED))
+
+local draggingSlider = false
+local function updateFromMouseX(mouseX)
+    local rel = math.clamp(
+        (mouseX - gui.trackBar.AbsolutePosition.X) / gui.trackBar.AbsoluteSize.X,
+        0, 1
+    )
+    updateSpeedDisplay(rel)
+end
+
+bind(gui.trackBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = true
+        updateFromMouseX(input.Position.X)
+    end
+end))
+
+bind(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = false
+    end
+end))
+
+bind(UserInputService.InputChanged:Connect(function(input)
+    if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        updateFromMouseX(input.Position.X)
+    end
+end))
+
+-- ============================================================
+-- BOUTON FERMER
+-- ============================================================
+bind(gui.closeBtn.MouseButton1Click:Connect(fullCleanup))
+
+bind(gui.closeBtn.MouseEnter:Connect(function()
+    TweenService:Create(gui.closeBtn, TweenInfo.new(0.15),
+        { BackgroundColor3 = C.danger, TextColor3 = C.text }):Play()
+end))
+
+bind(gui.closeBtn.MouseLeave:Connect(function()
+    TweenService:Create(gui.closeBtn, TweenInfo.new(0.15),
+        { BackgroundColor3 = C.bgActive, TextColor3 = C.textDim }):Play()
+end))
+
+-- ============================================================
+-- TOGGLE + MÉTHODE
+-- ============================================================
+bind(gui.toggleBtn.MouseButton1Click:Connect(toggleSpinbot))
+
+bind(gui.toggleBtn.MouseEnter:Connect(function()
+    if not gui then return end
+    TweenService:Create(gui.toggleBtn, TweenInfo.new(0.15), {
+        BackgroundColor3 = Spinbot.enabled and C.accentHover or C.bgHover
+    }):Play()
+end))
+
+bind(gui.toggleBtn.MouseLeave:Connect(function()
+    if not gui then return end
+    TweenService:Create(gui.toggleBtn, TweenInfo.new(0.15), {
+        BackgroundColor3 = Spinbot.enabled and C.accent or C.bgActive
+    }):Play()
+end))
+
+bind(gui.methodBtn.MouseButton1Click:Connect(function()
+    Spinbot.method = Spinbot.method == 1 and 2 or 1
+    gui.methodBtn.Text = Spinbot.method == 1
+        and "AssemblyAngularVelocity"
+        or "AngularVelocity (constraint)"
+    if Spinbot.enabled then
+        applySpinbot()
+    end
+end))
+
+bind(gui.methodBtn.MouseEnter:Connect(function()
+    if gui then
+        TweenService:Create(gui.methodBtn, TweenInfo.new(0.15),
+            { BackgroundColor3 = C.bgHover }):Play()
+    end
+end))
+
+bind(gui.methodBtn.MouseLeave:Connect(function()
+    if gui then
+        TweenService:Create(gui.methodBtn, TweenInfo.new(0.15),
+            { BackgroundColor3 = C.bgActive }):Play()
+    end
+end))
+
+-- ============================================================
+-- CHARACTER HOOKS
+-- ============================================================
+local function onCharacterAdded(char)
+    char:WaitForChild("HumanoidRootPart", 10)
+    local hum = char:WaitForChild("Humanoid", 10)
+    if Spinbot.enabled then
+        task.wait(0.1)
+        applySpinbot()
+    end
+    if hum then
+        bind(hum.Died:Connect(disableSpinbot))
+    end
+end
+
+bind(LocalPlayer.CharacterAdded:Connect(onCharacterAdded))
+if LocalPlayer.Character then
+    task.spawn(onCharacterAdded, LocalPlayer.Character)
+end
+
+-- ============================================================
+-- KEYBIND
+-- ============================================================
+local TOGGLE_KEY = Enum.KeyCode.RightShift
+if getgenv and getgenv().MenuKey == Enum.KeyCode.RightShift then
+    TOGGLE_KEY = Enum.KeyCode.RightControl
+end
+
+bind(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or isShutdown then return end
+    if input.KeyCode == TOGGLE_KEY then
+        toggleSpinbot()
+    end
+end))
+
+-- ============================================================
+-- CTRL + MOLETTE
+-- ============================================================
+bind(UserInputService.InputChanged:Connect(function(input)
+    if isShutdown or not gui then return end
+    if input.UserInputType == Enum.UserInputType.MouseWheel then
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+        or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
+            gui.uiScale.Scale = math.clamp(
+                gui.uiScale.Scale + input.Position.Z * 0.05, 0.6, 1.6
+            )
+        end
+    end
+end))
+
+-- ============================================================
+-- INIT
+-- ============================================================
+setStatus("ready", C.textDim)
+print("[Spinbot] v3.0 chargé.")
+print("[Spinbot] Drag : header uniquement · ✕ : fermeture propre.")
