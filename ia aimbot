@@ -1,7 +1,10 @@
 --!optimize 2
--- ============================================================
--- Aimbot | Smooth & Close-Range Fixed | by azerty098890
--- ============================================================
+-- =====================================================================
+-- Aimbot | Smooth & Close-Range Fixed | Universal Remote-Compatible
+-- =====================================================================
+-- Correction appliquée : suppression des références à MouseButton4/5
+-- qui ne sont pas des membres valides de Enum.UserInputType.
+-- =====================================================================
 
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
@@ -12,6 +15,7 @@ local HttpService      = game:GetService("HttpService")
 local workspace        = workspace
 local Vector2_new      = Vector2.new
 local Vector3_new      = Vector3.new
+local CFrame_new       = CFrame.new
 local CFrame_lookAt    = CFrame.lookAt
 local math_clamp       = math.clamp
 local math_random      = math.random
@@ -19,8 +23,11 @@ local os_clock         = os.clock or tick or function() return 0 end
 local table_clear      = table.clear or function(t) for k in pairs(t) do t[k] = nil end end
 local table_remove     = table.remove
 local table_sort       = table.sort
+local table_unpack     = table.unpack or unpack
+local typeof           = typeof
 local task_wait        = task.wait
 local task_spawn       = task.spawn
+local task_cancel      = task.cancel
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -29,31 +36,296 @@ workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
     cachedCamera = workspace.CurrentCamera
 end)
 
--- ============================================================
+-- =====================================================================
 -- BIND HELPERS
--- ============================================================
+-- =====================================================================
+-- Correction : seuls MouseButton1, 2 et 3 sont des UserInputType valides.
+local MOUSE_ENUM = {
+    [1] = Enum.UserInputType.MouseButton1,
+    [2] = Enum.UserInputType.MouseButton2,
+    [3] = Enum.UserInputType.MouseButton3,
+}
+
 local function keyBind(code) return { kind = "key", code = code } end
 local function mouseBind(index) return { kind = "mouse", index = index } end
-local function bindLabel(b) if b.kind == "key" then return b.code.Name end; return "M" .. tostring(b.index) end
+local function bindLabel(b)
+    if b.kind == "key" then return b.code.Name end
+    return "M" .. tostring(b.index)
+end
 
-local mouseHeld = { [1] = false, [2] = false, [3] = false, [4] = false, [5] = false }
-local m45Seen   = { [4] = false, [5] = false }
+local mouseHeld = { [1] = false, [2] = false, [3] = false }
+
 local function extractMouseIndex(ut)
     if not ut then return nil end
     local okName, nm = pcall(function() return ut.Name end)
-    if okName and nm then local idx = tonumber(nm:match("MouseButton(%d+)")); if idx then return idx end end
+    if okName and nm then
+        local idx = tonumber(nm:match("MouseButton(%d+)"))
+        if idx and idx <= 3 then return idx end
+    end
     local okVal, val = pcall(function() return ut.Value end)
-    if okVal and val and val >= 1 and val <= 5 then return val end
+    if okVal and val and val >= 1 and val <= 3 then return val end
     return nil
 end
+
 local function isBindDown(b)
-    if b.kind == "key" then local ok, down = pcall(function() return UserInputService:IsKeyDown(b.code) end); return ok and down
-    else if mouseHeld[b.index] then return true end; local ok, down = pcall(function() return UserInputService:IsMouseButtonPressed(b.index) end); return ok and down end
+    if b.kind == "key" then
+        local ok, down = pcall(function() return UserInputService:IsKeyDown(b.code) end)
+        return ok and down
+    else
+        if mouseHeld[b.index] then return true end
+        local enumType = MOUSE_ENUM[b.index]
+        if not enumType then return false end
+        local ok, down = pcall(function() return UserInputService:IsMouseButtonPressed(enumType) end)
+        return ok and down
+    end
 end
 
--- ============================================================
+-- =====================================================================
+-- UNIVERSAL REMOTE HOOK ENGINE
+-- =====================================================================
+local RemoteAim = {
+    enabled       = false,
+    shotRemotes   = {},
+    lastFireTime  = 0,
+    detectWindow  = 0.35,
+    hookInstalled = false,
+    originalNamecall = nil,
+    originalFireServer = nil,
+    originalInvokeServer = nil,
+    originalFire = nil,
+    originalInvoke = nil,
+    dummyRemote = nil,
+    dummyUnreliable = nil,
+    dummyRemoteFunction = nil,
+    dummyBindableEvent = nil,
+    dummyBindableFunction = nil,
+}
+
+local function isAimValue(v)
+    local t = typeof(v)
+    if t == "CFrame" or t == "Vector3" then return true end
+    if t == "table" then
+        for _, sub in pairs(v) do
+            local st = typeof(sub)
+            if st == "CFrame" or st == "Vector3" then return true end
+        end
+    end
+    return false
+end
+
+local function replaceAimValue(args, targetPos)
+    local origin = cachedCamera and cachedCamera.CFrame.Position or Vector3_new(0, 0, 0)
+    for i = 1, #args do
+        local v = args[i]
+        local t = typeof(v)
+        if t == "CFrame" then
+            args[i] = CFrame_new(targetPos) * v.Rotation
+            return true
+        elseif t == "Vector3" then
+            if v.Magnitude < 10 then
+                args[i] = (targetPos - origin).Unit
+            else
+                args[i] = targetPos
+            end
+            return true
+        elseif t == "table" then
+            for k, sub in pairs(v) do
+                local st = typeof(sub)
+                if st == "CFrame" then
+                    v[k] = CFrame_new(targetPos) * sub.Rotation
+                    return true
+                elseif st == "Vector3" then
+                    if sub.Magnitude < 10 then
+                        v[k] = (targetPos - origin).Unit
+                    else
+                        v[k] = targetPos
+                    end
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local REMOTE_CLASSES = {
+    RemoteEvent           = true,
+    UnreliableRemoteEvent = true,
+    RemoteFunction        = true,
+    BindableEvent         = true,
+    BindableFunction      = true,
+}
+
+local function isRemoteInstance(inst)
+    if not inst or typeof(inst) ~= "Instance" then return false end
+    local ok, cls = pcall(function() return inst.ClassName end)
+    return ok and cls and REMOTE_CLASSES[cls] == true
+end
+
+local FIRING_METHODS = {
+    FireServer   = true,
+    fireServer   = true,
+    InvokeServer = true,
+    invokeServer = true,
+    Fire         = true,
+    Invoke       = true,
+}
+
+local function installNamecallHook()
+    if not hookmetamethod or not getrawmetatable or not getnamecallmethod then
+        return false
+    end
+    local mt = getrawmetatable(game)
+    if not mt or not mt.__namecall then return false end
+
+    local old = mt.__namecall
+    RemoteAim.originalNamecall = old
+    setreadonly(mt, false)
+
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if not FIRING_METHODS[method] then
+            return old(self, ...)
+        end
+        if not isRemoteInstance(self) then
+            return old(self, ...)
+        end
+
+        local args = { ... }
+        if os_clock() - RemoteAim.lastFireTime < RemoteAim.detectWindow then
+            if isAimValue(args[1]) or isAimValue(args[2]) then
+                RemoteAim.shotRemotes[self] = true
+            end
+        end
+
+        if RemoteAim.enabled and RemoteAim.shotRemotes[self] and currentTarget then
+            local targetPos = currentTarget.worldPos
+            if targetPos then
+                replaceAimValue(args, targetPos)
+            end
+        end
+
+        return old(self, table_unpack(args))
+    end)
+
+    setreadonly(mt, true)
+    RemoteAim.hookInstalled = true
+    return true
+end
+
+local function installDirectHooks()
+    if not hookfunction then return false end
+
+    pcall(function()
+        RemoteAim.dummyRemote = Instance.new("RemoteEvent")
+        RemoteAim.originalFireServer = hookfunction(
+            RemoteAim.dummyRemote.FireServer,
+            newcclosure(function(self, ...)
+                local args = { ... }
+                if RemoteAim.enabled and RemoteAim.shotRemotes[self] and currentTarget then
+                    local targetPos = currentTarget.worldPos
+                    if targetPos then
+                        replaceAimValue(args, targetPos)
+                    end
+                end
+                return RemoteAim.originalFireServer(self, table_unpack(args))
+            end)
+        )
+    end)
+
+    pcall(function()
+        RemoteAim.dummyUnreliable = Instance.new("UnreliableRemoteEvent")
+    end)
+
+    pcall(function()
+        RemoteAim.dummyRemoteFunction = Instance.new("RemoteFunction")
+        RemoteAim.originalInvokeServer = hookfunction(
+            RemoteAim.dummyRemoteFunction.InvokeServer,
+            newcclosure(function(self, ...)
+                local args = { ... }
+                if RemoteAim.enabled and RemoteAim.shotRemotes[self] and currentTarget then
+                    local targetPos = currentTarget.worldPos
+                    if targetPos then
+                        replaceAimValue(args, targetPos)
+                    end
+                end
+                return RemoteAim.originalInvokeServer(self, table_unpack(args))
+            end)
+        )
+    end)
+
+    pcall(function()
+        RemoteAim.dummyBindableEvent = Instance.new("BindableEvent")
+        RemoteAim.originalFire = hookfunction(
+            RemoteAim.dummyBindableEvent.Fire,
+            newcclosure(function(self, ...)
+                local args = { ... }
+                if RemoteAim.enabled and RemoteAim.shotRemotes[self] and currentTarget then
+                    local targetPos = currentTarget.worldPos
+                    if targetPos then
+                        replaceAimValue(args, targetPos)
+                    end
+                end
+                return RemoteAim.originalFire(self, table_unpack(args))
+            end)
+        )
+    end)
+
+    pcall(function()
+        RemoteAim.dummyBindableFunction = Instance.new("BindableFunction")
+        RemoteAim.originalInvoke = hookfunction(
+            RemoteAim.dummyBindableFunction.Invoke,
+            newcclosure(function(self, ...)
+                local args = { ... }
+                if RemoteAim.enabled and RemoteAim.shotRemotes[self] and currentTarget then
+                    local targetPos = currentTarget.worldPos
+                    if targetPos then
+                        replaceAimValue(args, targetPos)
+                    end
+                end
+                return RemoteAim.originalInvoke(self, table_unpack(args))
+            end)
+        )
+    end)
+
+    return true
+end
+
+local function installRemoteHooks()
+    if RemoteAim.hookInstalled then return true end
+    local ok1 = installNamecallHook()
+    local ok2 = installDirectHooks()
+    RemoteAim.hookInstalled = ok1 or ok2
+    return RemoteAim.hookInstalled
+end
+
+local function uninstallRemoteHooks()
+    if RemoteAim.originalNamecall then
+        pcall(function()
+            local mt = getrawmetatable(game)
+            if mt and mt.__namecall then
+                setreadonly(mt, false)
+                mt.__namecall = RemoteAim.originalNamecall
+                setreadonly(mt, true)
+            end
+        end)
+        RemoteAim.originalNamecall = nil
+    end
+    RemoteAim.originalFireServer = nil
+    RemoteAim.originalInvokeServer = nil
+    RemoteAim.originalFire = nil
+    RemoteAim.originalInvoke = nil
+    for _, key in ipairs({ "dummyRemote", "dummyUnreliable", "dummyRemoteFunction", "dummyBindableEvent", "dummyBindableFunction" }) do
+        local inst = RemoteAim[key]
+        if inst then pcall(function() inst:Destroy() end) end
+        RemoteAim[key] = nil
+    end
+    RemoteAim.hookInstalled = false
+end
+
+-- =====================================================================
 -- SAVE SYSTEM
--- ============================================================
+-- =====================================================================
 local Config
 local SAVE_FILE = "aimbot_config.json"
 local SaveData = {}
@@ -71,111 +343,323 @@ end
 
 local function writeSave()
     if not writefile or not Config then return end
-    SaveData.HoldToAim = Config.HoldToAim; SaveData.TeamCheck = Config.TeamCheck; SaveData.VisibleCheck = Config.VisibleCheck
-    SaveData.UsePrediction = Config.UsePrediction; SaveData.TargetPlayers = Config.TargetPlayers; SaveData.TargetNPCs = Config.TargetNPCs
-    SaveData.EnemyOnly = Config.EnemyOnly; SaveData.FOVRadius = Config.FOVRadius; SaveData.Smoothing = Config.Smoothing
-    SaveData.Prediction = Config.Prediction; SaveData.HRPJitterRadius = Config.HRPJitterRadius
-    SaveData.TargetPart = Config.TargetPart; SaveData.TargetMode = Config.TargetMode
-    SaveData.CircleColor = string.format("%d,%d,%d", math.floor(Config.CircleColor.R*255+0.5), math.floor(Config.CircleColor.G*255+0.5), math.floor(Config.CircleColor.B*255+0.5))
-    if Config.AimbotBind.kind == "key" then SaveData.AimbotBindKind="key"; SaveData.AimbotBindName=Config.AimbotBind.code.Name; SaveData.AimbotBindIndex=nil
-    else SaveData.AimbotBindKind="mouse"; SaveData.AimbotBindName=nil; SaveData.AimbotBindIndex=Config.AimbotBind.index end
+    SaveData.HoldToAim        = Config.HoldToAim
+    SaveData.TeamCheck        = Config.TeamCheck
+    SaveData.VisibleCheck     = Config.VisibleCheck
+    SaveData.UsePrediction    = Config.UsePrediction
+    SaveData.TargetPlayers    = Config.TargetPlayers
+    SaveData.TargetNPCs       = Config.TargetNPCs
+    SaveData.EnemyOnly        = Config.EnemyOnly
+    SaveData.FOVRadius        = Config.FOVRadius
+    SaveData.Smoothing        = Config.Smoothing
+    SaveData.Prediction       = Config.Prediction
+    SaveData.HRPJitterRadius  = Config.HRPJitterRadius
+    SaveData.TargetPart       = Config.TargetPart
+    SaveData.TargetMode       = Config.TargetMode
+    SaveData.AimMode          = Config.AimMode
+    SaveData.CircleColor      = string.format("%d,%d,%d",
+        math.floor(Config.CircleColor.R * 255 + 0.5),
+        math.floor(Config.CircleColor.G * 255 + 0.5),
+        math.floor(Config.CircleColor.B * 255 + 0.5))
+    if Config.AimbotBind.kind == "key" then
+        SaveData.AimbotBindKind = "key"
+        SaveData.AimbotBindName = Config.AimbotBind.code.Name
+        SaveData.AimbotBindIndex = nil
+    else
+        SaveData.AimbotBindKind = "mouse"
+        SaveData.AimbotBindName = nil
+        SaveData.AimbotBindIndex = Config.AimbotBind.index
+    end
     pcall(function() writefile(SAVE_FILE, HttpService:JSONEncode(SaveData)) end)
 end
+
 local saveQueued = false
-local function saveSoon() if saveQueued then return end; saveQueued = true; task.defer(function() saveQueued = false; writeSave() end) end
+local function saveSoon()
+    if saveQueued then return end
+    saveQueued = true
+    task.defer(function()
+        saveQueued = false
+        writeSave()
+    end)
+end
 loadSave()
 
--- ============================================================
+-- =====================================================================
 -- CONFIG
--- ============================================================
+-- =====================================================================
 Config = {
-    Enabled = false, Held = false, HoldToAim = false,
-    TeamCheck = true, VisibleCheck = true, UsePrediction = true,
-    TargetPlayers = true, TargetNPCs = true, EnemyOnly = false,
-    FOVRadius = 120, 
-    Smoothing = 2.5, -- 1 = très rapide (brusque), 10 = très lent (fluide)
-    Prediction = 0.135,
-    TargetPart = "HumanoidRootPart",
-    TargetMode = "Mouse",
-    HRPJitterInterval = 1.0, HRPJitterRadius = 0.65,
-    CircleColor = Color3.fromRGB(0, 200, 255),
-    AimbotBind = keyBind(Enum.KeyCode.F),
+    Enabled            = false,
+    Held               = false,
+    HoldToAim          = false,
+    TeamCheck          = true,
+    VisibleCheck       = true,
+    UsePrediction      = true,
+    TargetPlayers      = true,
+    TargetNPCs         = true,
+    EnemyOnly          = false,
+    FOVRadius          = 120,
+    Smoothing          = 2.5,
+    Prediction         = 0.135,
+    TargetPart         = "HumanoidRootPart",
+    TargetMode         = "Mouse",
+    AimMode            = "Camera",
+    HRPJitterInterval  = 1.0,
+    HRPJitterRadius    = 0.65,
+    CircleColor        = Color3.fromRGB(0, 200, 255),
+    AimbotBind         = keyBind(Enum.KeyCode.F),
 }
 
-if type(SaveData.HoldToAim)=="boolean" then Config.HoldToAim=SaveData.HoldToAim end
-if type(SaveData.TeamCheck)=="boolean" then Config.TeamCheck=SaveData.TeamCheck end
-if type(SaveData.VisibleCheck)=="boolean" then Config.VisibleCheck=SaveData.VisibleCheck end
-if type(SaveData.UsePrediction)=="boolean" then Config.UsePrediction=SaveData.UsePrediction end
-if type(SaveData.TargetPlayers)=="boolean" then Config.TargetPlayers=SaveData.TargetPlayers end
-if type(SaveData.TargetNPCs)=="boolean" then Config.TargetNPCs=SaveData.TargetNPCs end
-if type(SaveData.EnemyOnly)=="boolean" then Config.EnemyOnly=SaveData.EnemyOnly end
-if type(SaveData.FOVRadius)=="number" then Config.FOVRadius=math_clamp(SaveData.FOVRadius,50,500) end
-if type(SaveData.Smoothing)=="number" then Config.Smoothing=math_clamp(SaveData.Smoothing,1,15) end
-if type(SaveData.Prediction)=="number" then Config.Prediction=math_clamp(SaveData.Prediction,0,0.5) end
-if type(SaveData.HRPJitterRadius)=="number" then Config.HRPJitterRadius=math_clamp(SaveData.HRPJitterRadius,0,2) end
-if type(SaveData.TargetPart)=="string" and (SaveData.TargetPart=="Head" or SaveData.TargetPart=="HumanoidRootPart" or SaveData.TargetPart=="UpperTorso" or SaveData.TargetPart=="Torso") then Config.TargetPart=SaveData.TargetPart end
-if type(SaveData.TargetMode)=="string" and (SaveData.TargetMode=="Mouse" or SaveData.TargetMode=="Center") then Config.TargetMode=SaveData.TargetMode end
-if type(SaveData.CircleColor)=="string" then local r,g,b=SaveData.CircleColor:match("^(%d+),(%d+),(%d+)$"); if r then Config.CircleColor=Color3.fromRGB(math_clamp(tonumber(r) or 0,0,255),math_clamp(tonumber(g) or 0,0,255),math_clamp(tonumber(b) or 0,0,255)) end end
-if SaveData.AimbotBindKind=="key" and type(SaveData.AimbotBindName)=="string" then local ok, code=pcall(function() return Enum.KeyCode[SaveData.AimbotBindName] end); if ok and code then Config.AimbotBind=keyBind(code) end
-elseif SaveData.AimbotBindKind=="mouse" and type(SaveData.AimbotBindIndex)=="number" then local idx=math.floor(SaveData.AimbotBindIndex); if idx>=1 and idx<=5 then Config.AimbotBind=mouseBind(idx) end end
-local reservedKeys = { [Enum.KeyCode.P]=true,[Enum.KeyCode.Semicolon]=true,[Enum.KeyCode.LeftBracket]=true,[Enum.KeyCode.RightBracket]=true,[Enum.KeyCode.RightShift]=true }
-if Config.AimbotBind.kind=="key" and reservedKeys[Config.AimbotBind.code] then Config.AimbotBind=keyBind(Enum.KeyCode.C) end
+if type(SaveData.HoldToAim) == "boolean" then Config.HoldToAim = SaveData.HoldToAim end
+if type(SaveData.TeamCheck) == "boolean" then Config.TeamCheck = SaveData.TeamCheck end
+if type(SaveData.VisibleCheck) == "boolean" then Config.VisibleCheck = SaveData.VisibleCheck end
+if type(SaveData.UsePrediction) == "boolean" then Config.UsePrediction = SaveData.UsePrediction end
+if type(SaveData.TargetPlayers) == "boolean" then Config.TargetPlayers = SaveData.TargetPlayers end
+if type(SaveData.TargetNPCs) == "boolean" then Config.TargetNPCs = SaveData.TargetNPCs end
+if type(SaveData.EnemyOnly) == "boolean" then Config.EnemyOnly = SaveData.EnemyOnly end
+if type(SaveData.FOVRadius) == "number" then Config.FOVRadius = math_clamp(SaveData.FOVRadius, 50, 500) end
+if type(SaveData.Smoothing) == "number" then Config.Smoothing = math_clamp(SaveData.Smoothing, 1, 10) end
+if type(SaveData.Prediction) == "number" then Config.Prediction = math_clamp(SaveData.Prediction, 0, 0.5) end
+if type(SaveData.HRPJitterRadius) == "number" then Config.HRPJitterRadius = math_clamp(SaveData.HRPJitterRadius, 0, 2) end
+if type(SaveData.TargetPart) == "string" and
+   (SaveData.TargetPart == "Head" or SaveData.TargetPart == "HumanoidRootPart" or
+    SaveData.TargetPart == "UpperTorso" or SaveData.TargetPart == "Torso") then
+    Config.TargetPart = SaveData.TargetPart
+end
+if type(SaveData.TargetMode) == "string" and
+   (SaveData.TargetMode == "Mouse" or SaveData.TargetMode == "Center") then
+    Config.TargetMode = SaveData.TargetMode
+end
+if type(SaveData.AimMode) == "string" and
+   (SaveData.AimMode == "Camera" or SaveData.AimMode == "Remote") then
+    Config.AimMode = SaveData.AimMode
+end
+if type(SaveData.CircleColor) == "string" then
+    local r, g, b = SaveData.CircleColor:match("^(%d+),(%d+),(%d+)$")
+    if r then
+        Config.CircleColor = Color3.fromRGB(
+            math_clamp(tonumber(r) or 0, 0, 255),
+            math_clamp(tonumber(g) or 0, 0, 255),
+            math_clamp(tonumber(b) or 0, 0, 255))
+    end
+end
+if SaveData.AimbotBindKind == "key" and type(SaveData.AimbotBindName) == "string" then
+    local ok, code = pcall(function() return Enum.KeyCode[SaveData.AimbotBindName] end)
+    if ok and code then Config.AimbotBind = keyBind(code) end
+elseif SaveData.AimbotBindKind == "mouse" and type(SaveData.AimbotBindIndex) == "number" then
+    local idx = math.floor(SaveData.AimbotBindIndex)
+    if idx >= 1 and idx <= 3 then Config.AimbotBind = mouseBind(idx) end
+end
 
--- ============================================================
+local reservedKeys = {
+    [Enum.KeyCode.P] = true,
+    [Enum.KeyCode.Semicolon] = true,
+    [Enum.KeyCode.LeftBracket] = true,
+    [Enum.KeyCode.RightBracket] = true,
+    [Enum.KeyCode.RightShift] = true,
+}
+if Config.AimbotBind.kind == "key" and reservedKeys[Config.AimbotBind.code] then
+    Config.AimbotBind = keyBind(Enum.KeyCode.C)
+end
+
+local function syncRemoteAim()
+    RemoteAim.enabled = (Config.AimMode == "Remote")
+    if RemoteAim.enabled then
+        installRemoteHooks()
+    else
+        uninstallRemoteHooks()
+    end
+end
+
+-- =====================================================================
 -- PREFS / TEAMS
--- ============================================================
-local PREF_FILE="aimbot_prefs.json"; local PlayerPrefs={}
-local function loadPrefs() if not readfile then return end; pcall(function() if isfile and not isfile(PREF_FILE) then return end; local raw=readfile(PREF_FILE); if type(raw)~="string" or raw=="" then return end; local d=HttpService:JSONDecode(raw); if type(d)=="table" then for k,v in pairs(d) do if type(k)=="string" and (v=="friend" or v=="enemy") then PlayerPrefs[k]=v end end end end) end
-local function savePrefs() if not writefile then return end; pcall(function() writefile(PREF_FILE,HttpService:JSONEncode(PlayerPrefs)) end) end
+-- =====================================================================
+local PREF_FILE = "aimbot_prefs.json"
+local PlayerPrefs = {}
+
+local function loadPrefs()
+    if not readfile then return end
+    pcall(function()
+        if isfile and not isfile(PREF_FILE) then return end
+        local raw = readfile(PREF_FILE)
+        if type(raw) ~= "string" or raw == "" then return end
+        local d = HttpService:JSONDecode(raw)
+        if type(d) == "table" then
+            for k, v in pairs(d) do
+                if type(k) == "string" and (v == "friend" or v == "enemy") then
+                    PlayerPrefs[k] = v
+                end
+            end
+        end
+    end)
+end
+local function savePrefs()
+    if not writefile then return end
+    pcall(function() writefile(PREF_FILE, HttpService:JSONEncode(PlayerPrefs)) end)
+end
 loadPrefs()
-local TEAMS_FILE="aimbot_teams.json"; local SelectedTeams={}; local teamFilterActive=false
-local function teamKeyOf(plr) local t=plr.Team; return t and t.Name or "__none" end
-local function recalcTeamFilter() teamFilterActive = next(SelectedTeams) ~= nil end
-local function loadTeams() if not readfile then return end; pcall(function() if isfile and not isfile(TEAMS_FILE) then return end; local raw=readfile(TEAMS_FILE); if type(raw)~="string" or raw=="" then return end; local d=HttpService:JSONDecode(raw); if type(d)=="table" then for k,v in pairs(d) do if type(k)=="string" and v==true then SelectedTeams[k]=true end end end end); recalcTeamFilter() end
-local function saveTeams() if not writefile then return end; pcall(function() writefile(TEAMS_FILE,HttpService:JSONEncode(SelectedTeams)) end) end
+
+local TEAMS_FILE = "aimbot_teams.json"
+local SelectedTeams = {}
+local teamFilterActive = false
+
+local function teamKeyOf(plr)
+    local t = plr.Team
+    return t and t.Name or "__none"
+end
+local function recalcTeamFilter()
+    teamFilterActive = next(SelectedTeams) ~= nil
+end
+local function loadTeams()
+    if not readfile then return end
+    pcall(function()
+        if isfile and not isfile(TEAMS_FILE) then return end
+        local raw = readfile(TEAMS_FILE)
+        if type(raw) ~= "string" or raw == "" then return end
+        local d = HttpService:JSONDecode(raw)
+        if type(d) == "table" then
+            for k, v in pairs(d) do
+                if type(k) == "string" and v == true then SelectedTeams[k] = true end
+            end
+        end
+    end)
+    recalcTeamFilter()
+end
+local function saveTeams()
+    if not writefile then return end
+    pcall(function() writefile(TEAMS_FILE, HttpService:JSONEncode(SelectedTeams)) end)
+end
 loadTeams()
 
--- ============================================================
--- LIFECYCLE
--- ============================================================
-local Connections={}; local closed=false; local guiRef,renderConn,scanConn,guiConn=nil,nil,nil,nil
-local function track(c) table.insert(Connections,c); return c end
-local fovCircle; local candidates,candidateSet,candidateTeam,candidateOwner,partCache,hrpJitters; local currentTarget
+-- =====================================================================
+-- LIFECYCLE + PER-PLAYER CONNECTIONS
+-- =====================================================================
+local Connections = {}
+local closed = false
+local guiRef, renderConn, scanConn, guiConn = nil, nil, nil, nil
+local function track(c)
+    table.insert(Connections, c)
+    return c
+end
+
+local PlayerConnections = {}
+local function trackPlayer(plr, conn)
+    if not plr then return conn end
+    local uid = plr.UserId
+    if not PlayerConnections[uid] then PlayerConnections[uid] = {} end
+    table.insert(PlayerConnections[uid], conn)
+    return conn
+end
+local function disconnectPlayer(plr)
+    local uid = plr.UserId
+    local list = PlayerConnections[uid]
+    if not list then return end
+    for _, c in ipairs(list) do
+        if c.Connected then pcall(function() c:Disconnect() end) end
+    end
+    PlayerConnections[uid] = nil
+end
+
+local fovCircle
+local candidates, candidateSet, candidateTeam, candidateOwner, partCache, hrpJitters
+local currentTarget
 
 local function cleanup()
-    if closed then return end; if writeSave then pcall(writeSave) end; closed=true
-    if renderConn then pcall(function() renderConn:Disconnect() end); renderConn=nil end
-    if scanConn then pcall(function() task.cancel(scanConn) end); scanConn=nil end
-    if guiConn then pcall(function() task.cancel(guiConn) end); guiConn=nil end
-    for _,c in ipairs(Connections) do pcall(function() c:Disconnect() end) end; Connections={}
-    Config.Enabled=false; Config.Held=false; currentTarget=nil
-    if fovCircle then pcall(function() fovCircle.Visible=false end); pcall(function() fovCircle:Remove() end); pcall(function() fovCircle:Destroy() end); fovCircle=nil end
-    if guiRef then pcall(function() guiRef:Destroy() end) end; guiRef=nil
-    if candidates then table_clear(candidates) end; if candidateSet then table_clear(candidateSet) end; if candidateTeam then table_clear(candidateTeam) end; if candidateOwner then table_clear(candidateOwner) end; if partCache then table_clear(partCache) end; if hrpJitters then table_clear(hrpJitters) end; if SelectedTeams then table_clear(SelectedTeams) end
+    if closed then return end
+    pcall(writeSave)
+    closed = true
+
+    if renderConn then pcall(function() renderConn:Disconnect() end); renderConn = nil end
+    if scanConn then pcall(function() task_cancel(scanConn) end); scanConn = nil end
+    if guiConn then pcall(function() task_cancel(guiConn) end); guiConn = nil end
+
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+    Connections = {}
+
+    for uid, list in pairs(PlayerConnections) do
+        for _, c in ipairs(list) do
+            if c.Connected then pcall(function() c:Disconnect() end) end
+        end
+        PlayerConnections[uid] = nil
+    end
+
+    Config.Enabled = false
+    Config.Held = false
+    currentTarget = nil
+
+    if fovCircle then
+        pcall(function() fovCircle.Visible = false end)
+        pcall(function() fovCircle:Remove() end)
+        pcall(function() fovCircle:Destroy() end)
+        fovCircle = nil
+    end
+
+    if guiRef then pcall(function() guiRef:Destroy() end) end
+    guiRef = nil
+
+    if candidates then table_clear(candidates) end
+    if candidateSet then table_clear(candidateSet) end
+    if candidateTeam then table_clear(candidateTeam) end
+    if candidateOwner then table_clear(candidateOwner) end
+    if partCache then table_clear(partCache) end
+    if hrpJitters then table_clear(hrpJitters) end
+    if SelectedTeams then table_clear(SelectedTeams) end
+
+    uninstallRemoteHooks()
     print("[Aimbot] Closed.")
 end
 
-local function isActive() if Config.HoldToAim then return Config.Held end; return Config.Enabled end
+local function isActive()
+    if Config.HoldToAim then return Config.Held end
+    return Config.Enabled
+end
 
--- ============================================================
+-- =====================================================================
 -- FOV CIRCLE
--- ============================================================
-fovCircle=Drawing.new("Circle"); fovCircle.Visible=false; fovCircle.Thickness=2; fovCircle.NumSides=60; fovCircle.Radius=Config.FOVRadius; fovCircle.Color=Config.CircleColor; fovCircle.Filled=false; fovCircle.Transparency=1
-local lastFovRadius,lastFovColor=Config.FOVRadius,Config.CircleColor
+-- =====================================================================
+local function makeFovCircle()
+    local ok, circle = pcall(function() return Drawing.new("Circle") end)
+    if ok and circle then
+        circle.Visible = false
+        circle.Thickness = 2
+        circle.NumSides = 60
+        circle.Radius = Config.FOVRadius
+        circle.Color = Config.CircleColor
+        circle.Filled = false
+        circle.Transparency = 1
+        return circle
+    end
+    return {
+        Visible = false, Radius = Config.FOVRadius, Color = Config.CircleColor,
+        Position = Vector2_new(0, 0), Thickness = 0, NumSides = 0,
+        Filled = false, Transparency = 1,
+        Remove = function() end, Destroy = function() end,
+    }
+end
+fovCircle = makeFovCircle()
+local lastFovRadius, lastFovColor = Config.FOVRadius, Config.CircleColor
 
--- ============================================================
+-- =====================================================================
 -- CANDIDATE CACHE
--- ============================================================
-candidates={}; candidateSet={}; candidateTeam={}; candidateOwner={}; partCache={}; hrpJitters={}; local candidateDirty=true
+-- =====================================================================
+candidates = {}
+candidateSet = {}
+candidateTeam = {}
+candidateOwner = {}
+partCache = {}
+hrpJitters = {}
+local candidateDirty = true
 
 local function scanSubtree(root)
-    local list=root:GetDescendants()
-    for i=1,#list do
-        local obj=list[i]
+    local list = root:GetDescendants()
+    for i = 1, #list do
+        local obj = list[i]
         if obj:IsA("Model") and not candidateSet[obj] then
-            local hum=obj:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health>0 and not Players:GetPlayerFromCharacter(obj) then
-                candidates[#candidates+1]=obj; candidateSet[obj]=true; candidateTeam[obj]=false; candidateOwner[obj]=nil
+            local hum = obj:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and not Players:GetPlayerFromCharacter(obj) then
+                candidates[#candidates + 1] = obj
+                candidateSet[obj] = true
+                candidateTeam[obj] = false
+                candidateOwner[obj] = nil
             end
         end
     end
@@ -183,124 +667,225 @@ end
 
 local function removeFromCandidates(model)
     if candidateSet[model] then
-        candidateSet[model]=nil; candidateTeam[model]=nil; candidateOwner[model]=nil; partCache[model]=nil
-        for i=#candidates,1,-1 do if candidates[i]==model then table_remove(candidates,i); break end end
+        candidateSet[model] = nil
+        candidateTeam[model] = nil
+        candidateOwner[model] = nil
+        partCache[model] = nil
+        for i = #candidates, 1, -1 do
+            if candidates[i] == model then
+                table_remove(candidates, i)
+                break
+            end
+        end
     end
 end
 
 local function rebuildCandidates()
-    table_clear(candidateSet); table_clear(candidateTeam); table_clear(candidateOwner); table_clear(partCache); candidates={}
-    if Config.TargetNPCs then pcall(scanSubtree,workspace) end
+    table_clear(candidateSet)
+    table_clear(candidateTeam)
+    table_clear(candidateOwner)
+    table_clear(partCache)
+    candidates = {}
+
+    if Config.TargetNPCs then pcall(scanSubtree, workspace) end
     if Config.TargetPlayers then
-        for _,plr in ipairs(Players:GetPlayers()) do
-            if plr~=LocalPlayer then
-                local char=plr.Character
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local char = plr.Character
                 if char and not candidateSet[char] then
-                    candidates[#candidates+1]=char; candidateSet[char]=true; candidateTeam[char]=plr.Team or false; candidateOwner[char]=plr
+                    candidates[#candidates + 1] = char
+                    candidateSet[char] = true
+                    candidateTeam[char] = plr.Team or false
+                    candidateOwner[char] = plr
                 end
             end
         end
     end
-    candidateDirty=false
+    candidateDirty = false
 end
-local function markDirty() candidateDirty=true end
 
--- ============================================================
+local function markDirty() candidateDirty = true end
+
+-- =====================================================================
 -- TARGET HELPERS
--- ============================================================
-local PART_CACHE_TTL=0.25
+-- =====================================================================
+local PART_CACHE_TTL = 0.25
+
 local function resolvePart(character)
-    local now=os_clock(); local c=partCache[character]
-    if c and now-c.t<PART_CACHE_TTL and c.part and c.part.Parent then return c.part end
-    local p=character:FindFirstChild(Config.TargetPart)
-    if not p and (Config.TargetPart=="UpperTorso" or Config.TargetPart=="Torso") then p=character:FindFirstChild("Torso") or character:FindFirstChild("UpperTorso") end
-    if not p then p=character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head") end
-    partCache[character]={part=p,t=now}; return p
+    local now = os_clock()
+    local c = partCache[character]
+    if c and now - c.t < PART_CACHE_TTL and c.part and c.part.Parent then
+        return c.part
+    end
+    local p = character:FindFirstChild(Config.TargetPart)
+    if not p and (Config.TargetPart == "UpperTorso" or Config.TargetPart == "Torso") then
+        p = character:FindFirstChild("Torso") or character:FindFirstChild("UpperTorso")
+    end
+    if not p then
+        p = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
+    end
+    partCache[character] = { part = p, t = now }
+    return p
 end
 
-local function toScreen(worldPos) local cam=cachedCamera; if not cam then return nil,false end; local sp,onScreen=cam:WorldToViewportPoint(worldPos); return sp,onScreen end
-local rayParams=RaycastParams.new(); local rayFilterList={LocalPlayer.Character}; rayParams.FilterType=Enum.RaycastFilterType.Exclude; rayParams.FilterDescendantsInstances=rayFilterList
-local function refreshLocalCharFilter() local c=LocalPlayer.Character; if rayFilterList[1]~=c then rayFilterList[1]=c; rayParams.FilterDescendantsInstances=rayFilterList end end
-refreshLocalCharFilter(); track(LocalPlayer.CharacterAdded:Connect(refreshLocalCharFilter))
-
-local function isFriendBlocking(targetPos)
+local function toScreen(worldPos)
     local cam = cachedCamera
-    if not cam then return false end
+    if not cam then return nil, false end
+    local sp, onScreen = cam:WorldToViewportPoint(worldPos)
+    return sp, onScreen
+end
+
+local rayParams = RaycastParams.new()
+local rayFilterList = { LocalPlayer.Character }
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.FilterDescendantsInstances = rayFilterList
+
+local function refreshLocalCharFilter()
+    local c = LocalPlayer.Character
+    if rayFilterList[1] ~= c then
+        rayFilterList[1] = c
+        rayParams.FilterDescendantsInstances = rayFilterList
+    end
+end
+refreshLocalCharFilter()
+track(LocalPlayer.CharacterAdded:Connect(refreshLocalCharFilter))
+
+local function hasLineOfSight(part, worldPos)
+    local cam = cachedCamera
+    if not cam then return true end
     local origin = cam.CFrame.Position
-    local dir = targetPos - origin
+    local dir = worldPos - origin
     local res = workspace:Raycast(origin, dir, rayParams)
-    
-    if res and res.Instance then
-        local hitModel = res.Instance:FindFirstAncestorOfClass("Model")
-        if hitModel then
-            local hitPlr = Players:GetPlayerFromCharacter(hitModel)
-            if hitPlr then
-                local state = PlayerPrefs[tostring(hitPlr.UserId)]
-                if state == "friend" then
-                    return true
+    if not res then return true end
+    return res.Instance and res.Instance:IsDescendantOf(part.Parent)
+end
+
+local function getHRPJitter(part)
+    local now = os_clock()
+    local c = hrpJitters[part]
+    if not c or now - c.lastT >= Config.HRPJitterInterval then
+        local r = Config.HRPJitterRadius
+        c = {
+            lastT = now,
+            offset = Vector3_new(
+                (math_random() * 2 - 1) * r,
+                (math_random() * 2 - 1) * r * 0.5,
+                (math_random() * 2 - 1) * r),
+        }
+        hrpJitters[part] = c
+    end
+    return c.offset
+end
+
+local MAX_STUDS_SQ = 2000 * 2000
+
+-- =====================================================================
+-- FIND TARGET
+-- =====================================================================
+local function findTarget()
+    local cam = cachedCamera or workspace.CurrentCamera
+    if not cam then return nil end
+
+    local mouse = UserInputService:GetMouseLocation()
+    local refX, refY
+    if Config.TargetMode == "Center" then
+        refX = cam.ViewportSize.X * 0.5
+        refY = cam.ViewportSize.Y * 0.5
+    else
+        refX = mouse.X
+        refY = mouse.Y
+    end
+    local camPos = cam.CFrame.Position
+    local fovSq = Config.FOVRadius * Config.FOVRadius
+
+    local bestVisible, bestVisibleD = nil, math.huge
+    local bestAny, bestAnyD = nil, math.huge
+
+    local myTeam = LocalPlayer.Team
+    local teamCount = 0
+    local teamSeen = {}
+    do
+        local all = Players:GetPlayers()
+        for i = 1, #all do
+            local p = all[i]
+            if p ~= LocalPlayer then
+                local k = teamKeyOf(p)
+                if not teamSeen[k] then
+                    teamSeen[k] = true
+                    teamCount = teamCount + 1
                 end
             end
         end
     end
-    return false
-end
+    local applyTeamFilter = teamFilterActive and teamCount >= 2
 
-local function hasLineOfSight(part,targetPos) 
-    local cam=cachedCamera; if not cam then return true end
-    if isFriendBlocking(targetPos) then return false end
-    
-    local origin=cam.CFrame.Position; local dir=targetPos-origin
-    local res=workspace:Raycast(origin,dir,rayParams)
-    if not res then return true end
-    return res.Instance and res.Instance:IsDescendantOf(part.Parent) 
-end
-
-local function getHRPJitter(part) local now=os_clock(); local c=hrpJitters[part]; if not c or now-c.lastT>=Config.HRPJitterInterval then local r=Config.HRPJitterRadius; c={lastT=now,offset=Vector3_new((math_random()*2-1)*r,(math_random()*2-1)*r*0.5,(math_random()*2-1)*r)}; hrpJitters[part]=c end; return c.offset end
-
-local bestHit={model=nil,part=nil,worldPos=nil,sx=0,sy=0}
-local MAX_STUDS_SQ=2000*2000
-
-local function findTarget()
-    local cam=cachedCamera or workspace.CurrentCamera; if not cam then return nil end
-    local mouse=UserInputService:GetMouseLocation(); local refX,refY
-    if Config.TargetMode=="Center" then refX=cam.ViewportSize.X*0.5; refY=cam.ViewportSize.Y*0.5 else refX=mouse.X; refY=mouse.Y end
-    local camPos=cam.CFrame.Position; local bestDistSq=Config.FOVRadius*Config.FOVRadius; local found=false
-    bestHit.model=nil; bestHit.part=nil; bestHit.worldPos=nil; bestHit.sx=0; bestHit.sy=0
-    local myTeam=LocalPlayer.Team
-    local teamCount=0; local teamSeen={}
-    do local all=Players:GetPlayers(); for i=1,#all do local p=all[i]; if p~=LocalPlayer then local k=teamKeyOf(p); if not teamSeen[k] then teamSeen[k]=true; teamCount=teamCount+1 end end end end
-    local applyTeamFilter=teamFilterActive and teamCount>=2
-
-    for i=#candidates,1,-1 do
-        local model=candidates[i]
-        if not model.Parent then removeFromCandidates(model) else
-            local skip=false
+    for i = #candidates, 1, -1 do
+        local model = candidates[i]
+        if not model.Parent then
+            removeFromCandidates(model)
+        else
+            local skip = false
             local modelHum = model:FindFirstChildOfClass("Humanoid")
             if modelHum and modelHum.Health <= 0 then skip = true end
-            if not skip and Config.TeamCheck then local t=candidateTeam[model]; if t and t==myTeam then skip=true end end
+
+            if not skip and Config.TeamCheck then
+                local t = candidateTeam[model]
+                if t and t == myTeam then skip = true end
+            end
+
             if not skip then
-                local owner=candidateOwner[model]
-                if applyTeamFilter and owner then local tt=candidateTeam[model]; local key=tt and tt.Name or "__none"; if not SelectedTeams[key] then skip=true end end
-                if not Config.TargetPlayers and owner then skip=true elseif not Config.TargetNPCs and not owner then skip=true end
+                local owner = candidateOwner[model]
+                if applyTeamFilter and owner then
+                    local tt = candidateTeam[model]
+                    local key = tt and tt.Name or "__none"
+                    if not SelectedTeams[key] then skip = true end
+                end
+                if not Config.TargetPlayers and owner then
+                    skip = true
+                elseif not Config.TargetNPCs and not owner then
+                    skip = true
+                end
                 if not skip then
-                    if owner then local state=PlayerPrefs[tostring(owner.UserId)]; if state=="friend" then skip=true elseif Config.EnemyOnly and state~="enemy" then skip=true end
-                    else if Config.EnemyOnly then skip=true end end
+                    if owner then
+                        local state = PlayerPrefs[tostring(owner.UserId)]
+                        if state == "friend" then
+                            skip = true
+                        elseif Config.EnemyOnly and state ~= "enemy" then
+                            skip = true
+                        end
+                    else
+                        if Config.EnemyOnly then skip = true end
+                    end
                 end
             end
+
             if not skip then
-                local part=resolvePart(model)
+                local part = resolvePart(model)
                 if part then
-                    local pos=part.Position
-                    if Config.UsePrediction then pos=pos+part.AssemblyLinearVelocity*Config.Prediction end
-                    if part.Name=="HumanoidRootPart" then pos=pos+getHRPJitter(part) end
-                    local d3=pos-camPos
-                    if d3:Dot(d3)<MAX_STUDS_SQ then
-                        local sp,onScreen=toScreen(pos)
+                    local actualPos = part.Position
+                    local aimPos = actualPos
+                    if Config.UsePrediction then
+                        aimPos = aimPos + part.AssemblyLinearVelocity * Config.Prediction
+                    end
+                    if part.Name == "HumanoidRootPart" then
+                        aimPos = aimPos + getHRPJitter(part)
+                    end
+                    local d3 = aimPos - camPos
+                    if d3:Dot(d3) < MAX_STUDS_SQ then
+                        local sp, onScreen = toScreen(aimPos)
                         if sp and onScreen then
-                            local dx=sp.X-refX; local dy=sp.Y-refY; local dSq=dx*dx+dy*dy
-                            if dSq<bestDistSq then
-                                if not Config.VisibleCheck or hasLineOfSight(part,pos) then
-                                    bestDistSq=dSq; bestHit.model=model; bestHit.part=part; bestHit.worldPos=pos; bestHit.sx=sp.X; bestHit.sy=sp.Y; found=true
+                            local dx = sp.X - refX
+                            local dy = sp.Y - refY
+                            local dSq = dx * dx + dy * dy
+                            if dSq < fovSq then
+                                local los = hasLineOfSight(part, actualPos)
+                                if dSq < bestAnyD then
+                                    bestAnyD = dSq
+                                    bestAny = { model = model, part = part, worldPos = aimPos, sx = sp.X, sy = sp.Y }
+                                end
+                                if los and dSq < bestVisibleD then
+                                    bestVisibleD = dSq
+                                    bestVisible = { model = model, part = part, worldPos = aimPos, sx = sp.X, sy = sp.Y }
                                 end
                             end
                         end
@@ -309,155 +894,234 @@ local function findTarget()
             end
         end
     end
-    if found then return bestHit end; return nil
+
+    if Config.VisibleCheck then return bestVisible end
+    return bestVisible or bestAny
 end
 
--- ============================================================
--- FUZZY MATCH
--- ============================================================
-local function levenshtein(a,b)
-    if a==b then return 0 end; local la,lb=#a,#b; if la==0 then return lb end; if lb==0 then return la end
-    local prev,curr={},{}
-    for j=0,lb do prev[j]=j end
-    for i=1,la do
-        curr[0]=i; local ai=a:sub(i,i)
-        for j=1,lb do
-            local cost=(ai==b:sub(j,j)) and 0 or 1; local del=prev[j]+1; local ins=curr[j-1]+1; local sub=prev[j-1]+cost; local m=del
-            if ins<m then m=ins end; if sub<m then m=sub end; curr[j]=m
+-- =====================================================================
+-- FUZZY MATCH (recherche de joueur dans la GUI)
+-- =====================================================================
+local function levenshtein(a, b)
+    if a == b then return 0 end
+    local la, lb = #a, #b
+    if la == 0 then return lb end
+    if lb == 0 then return la end
+    local prev, curr = {}, {}
+    for j = 0, lb do prev[j] = j end
+    for i = 1, la do
+        curr[0] = i
+        local ai = a:sub(i, i)
+        for j = 1, lb do
+            local cost = (ai == b:sub(j, j)) and 0 or 1
+            local del = prev[j] + 1
+            local ins = curr[j - 1] + 1
+            local sub = prev[j - 1] + cost
+            local m = del
+            if ins < m then m = ins end
+            if sub < m then m = sub end
+            curr[j] = m
         end
-        prev,curr=curr,prev
+        prev, curr = curr, prev
     end
     return prev[lb]
 end
 
--- ============================================================
+-- =====================================================================
 -- INPUT
--- ============================================================
-local rebinding=nil
-track(UserInputService.InputBegan:Connect(function(input,gp)
+-- =====================================================================
+local rebinding = nil
+track(UserInputService.InputBegan:Connect(function(input, gp)
     if closed then return end
-    local rawIdx=extractMouseIndex(input.UserInputType)
-    if rawIdx and mouseHeld[rawIdx]~=nil then
-        mouseHeld[rawIdx]=true
-        if rawIdx>=4 and not m45Seen[rawIdx] then m45Seen[rawIdx]=true; print("[Aimbot] M"..rawIdx.." détecté et bindable.") end
+    local rawIdx = extractMouseIndex(input.UserInputType)
+    if rawIdx and mouseHeld[rawIdx] ~= nil then
+        mouseHeld[rawIdx] = true
     end
+
     if rebinding then
-        if input.UserInputType==Enum.UserInputType.Keyboard then
-            if input.KeyCode==Enum.KeyCode.Escape then rebinding=nil
-            elseif input.KeyCode~=Enum.KeyCode.Unknown and not reservedKeys[input.KeyCode] then Config[rebinding]=keyBind(input.KeyCode); rebinding=nil; saveSoon() end
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            if input.KeyCode == Enum.KeyCode.Escape then
+                rebinding = nil
+            elseif input.KeyCode ~= Enum.KeyCode.Unknown and not reservedKeys[input.KeyCode] then
+                Config[rebinding] = keyBind(input.KeyCode)
+                rebinding = nil
+                saveSoon()
+            end
             return
         end
-        if rawIdx and rawIdx>=1 then Config[rebinding]=mouseBind(rawIdx); rebinding=nil; saveSoon(); return end
+        if rawIdx and rawIdx >= 1 then
+            Config[rebinding] = mouseBind(rawIdx)
+            rebinding = nil
+            saveSoon()
+            return
+        end
         return
     end
+
     if gp then return end
-    local function matches(bind,inp) if bind.kind=="key" then return inp.UserInputType==Enum.UserInputType.Keyboard and inp.KeyCode==bind.code else return extractMouseIndex(inp.UserInputType)==bind.index end end
-    if matches(Config.AimbotBind,input) then if not Config.HoldToAim then Config.Enabled=not Config.Enabled end end
+
+    local function matches(bind, inp)
+        if bind.kind == "key" then
+            return inp.UserInputType == Enum.UserInputType.Keyboard and inp.KeyCode == bind.code
+        else
+            return extractMouseIndex(inp.UserInputType) == bind.index
+        end
+    end
+    if matches(Config.AimbotBind, input) then
+        if not Config.HoldToAim then Config.Enabled = not Config.Enabled end
+    end
 end))
 
 track(UserInputService.InputEnded:Connect(function(input)
     if closed then return end
-    local rawIdx=extractMouseIndex(input.UserInputType)
-    if rawIdx and mouseHeld[rawIdx]~=nil then mouseHeld[rawIdx]=false end
+    local rawIdx = extractMouseIndex(input.UserInputType)
+    if rawIdx and mouseHeld[rawIdx] ~= nil then
+        mouseHeld[rawIdx] = false
+    end
 end))
 
--- ============================================================
+track(UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        RemoteAim.lastFireTime = os_clock()
+    end
+end))
+
+-- =====================================================================
 -- CANDIDATE MAINTENANCE
--- ============================================================
+-- =====================================================================
 local function onChildAdded(child)
     if closed then return end
     if child:IsA("Model") and not candidateSet[child] then
-        local hum=child:FindFirstChildOfClass("Humanoid")
-        if hum and hum.Health>0 and not Players:GetPlayerFromCharacter(child) then
-            candidates[#candidates+1]=child; candidateSet[child]=true; candidateTeam[child]=false; candidateOwner[child]=nil
+        local hum = child:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 and not Players:GetPlayerFromCharacter(child) then
+            candidates[#candidates + 1] = child
+            candidateSet[child] = true
+            candidateTeam[child] = false
+            candidateOwner[child] = nil
         end
     end
 end
-local function onChildRemoved(child) if closed then return end; removeFromCandidates(child) end
-track(workspace.ChildAdded:Connect(onChildAdded)); track(workspace.ChildRemoved:Connect(onChildRemoved))
-
-for _,plr in ipairs(Players:GetPlayers()) do
-    if plr~=LocalPlayer then
-        track(plr.CharacterAdded:Connect(markDirty)); track(plr.CharacterRemoving:Connect(markDirty)); track(plr:GetPropertyChangedSignal("Team"):Connect(markDirty))
-    end
+local function onChildRemoved(child)
+    if closed then return end
+    removeFromCandidates(child)
 end
-track(Players.PlayerAdded:Connect(function(plr)
-    track(plr.CharacterAdded:Connect(markDirty)); track(plr.CharacterRemoving:Connect(markDirty)); track(plr:GetPropertyChangedSignal("Team"):Connect(markDirty)); markDirty()
-end))
-track(Players.PlayerRemoving:Connect(markDirty))
+track(workspace.ChildAdded:Connect(onChildAdded))
+track(workspace.ChildRemoved:Connect(onChildRemoved))
 
--- ============================================================
+local function hookPlayer(plr)
+    if plr == LocalPlayer then return end
+    trackPlayer(plr, plr.CharacterAdded:Connect(markDirty))
+    trackPlayer(plr, plr.CharacterRemoving:Connect(markDirty))
+    trackPlayer(plr, plr:GetPropertyChangedSignal("Team"):Connect(markDirty))
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do hookPlayer(plr) end
+track(Players.PlayerAdded:Connect(function(plr) hookPlayer(plr); markDirty() end))
+track(Players.PlayerRemoving:Connect(function(plr) disconnectPlayer(plr); markDirty() end))
+
+-- =====================================================================
 -- SCAN LOOP
--- ============================================================
-scanConn=task_spawn(function()
-    local sweepTick=0
+-- =====================================================================
+scanConn = task_spawn(function()
+    local sweepTick = 0
     while not closed do
-        if candidateDirty then local ok=pcall(rebuildCandidates); if not ok then candidateDirty=true end end
-        local t=findTarget(); currentTarget=t
-        sweepTick=sweepTick+1
-        if sweepTick>=30 then sweepTick=0; for part in pairs(hrpJitters) do if not part.Parent then hrpJitters[part]=nil end end; for model in pairs(partCache) do if not model.Parent then partCache[model]=nil end end end
-        task_wait(1/30)
+        if candidateDirty then
+            local ok = pcall(rebuildCandidates)
+            if not ok then candidateDirty = true end
+        end
+
+        if isActive() then
+            currentTarget = findTarget()
+        else
+            currentTarget = nil
+        end
+
+        sweepTick = sweepTick + 1
+        if sweepTick >= 30 then
+            sweepTick = 0
+            for part in pairs(hrpJitters) do if not part.Parent then hrpJitters[part] = nil end end
+            for model in pairs(partCache) do if not model.Parent then partCache[model] = nil end end
+            for remote in pairs(RemoteAim.shotRemotes) do
+                if typeof(remote) ~= "Instance" or not remote.Parent then
+                    RemoteAim.shotRemotes[remote] = nil
+                end
+            end
+        end
+        task_wait(1 / 30)
     end
 end)
 
--- ============================================================
--- RENDER LOOP (FLUIDIFIÉ ET CORRIGÉ DE PRÈS)
--- ============================================================
+-- =====================================================================
+-- RENDER LOOP
+-- =====================================================================
 renderConn = RunService.RenderStepped:Connect(function(_dt)
     if closed then return end
-    if Config.HoldToAim then Config.Held=isBindDown(Config.AimbotBind) end
-    
-    if not isActive() then 
-        if fovCircle.Visible then fovCircle.Visible=false end
-        currentTarget=nil
-        return 
+
+    if Config.HoldToAim then
+        Config.Held = isBindDown(Config.AimbotBind)
     end
-    
-    local char=LocalPlayer.Character; local hum=char and char:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health<=0 then 
-        if fovCircle.Visible then fovCircle.Visible=false end
-        currentTarget=nil
-        return 
+
+    if not isActive() then
+        if fovCircle.Visible then fovCircle.Visible = false end
+        currentTarget = nil
+        return
     end
-    
-    local cam=cachedCamera or workspace.CurrentCamera; if not cam then return end
-    
-    if not fovCircle.Visible then fovCircle.Visible=true end
-    if Config.FOVRadius~=lastFovRadius then fovCircle.Radius=Config.FOVRadius; lastFovRadius=Config.FOVRadius end
-    if Config.CircleColor~=lastFovColor then fovCircle.Color=Config.CircleColor; lastFovColor=Config.CircleColor end
-    
-    if Config.TargetMode=="Center" then fovCircle.Position=Vector2_new(cam.ViewportSize.X*0.5,cam.ViewportSize.Y*0.5) else fovCircle.Position=UserInputService:GetMouseLocation() end
-    
-    local t=currentTarget
-    if t then 
+
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then
+        if fovCircle.Visible then fovCircle.Visible = false end
+        currentTarget = nil
+        return
+    end
+
+    local cam = cachedCamera or workspace.CurrentCamera
+    if not cam then return end
+
+    if not fovCircle.Visible then fovCircle.Visible = true end
+    if Config.FOVRadius ~= lastFovRadius then
+        fovCircle.Radius = Config.FOVRadius
+        lastFovRadius = Config.FOVRadius
+    end
+    if Config.CircleColor ~= lastFovColor then
+        fovCircle.Color = Config.CircleColor
+        lastFovColor = Config.CircleColor
+    end
+
+    if Config.TargetMode == "Center" then
+        fovCircle.Position = Vector2_new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y * 0.5)
+    else
+        fovCircle.Position = UserInputService:GetMouseLocation()
+    end
+
+    if Config.AimMode == "Remote" then return end
+
+    local t = currentTarget
+    if t then
         local sp, onScreen = toScreen(t.worldPos)
-        
-        -- On s'assure que la cible est bien devant (Z > 0)
         if sp and onScreen and sp.Z > 0 then
-            local centerX = cam.ViewportSize.X * 0.5
-            local centerY = cam.ViewportSize.Y * 0.5
-            local dx = sp.X - centerX
-            local dy = sp.Y - centerY
-            
-            -- Calcul de la distance réelle (3D) entre le joueur et la cible
+            local refX, refY
+            if Config.TargetMode == "Center" then
+                refX = cam.ViewportSize.X * 0.5
+                refY = cam.ViewportSize.Y * 0.5
+            else
+                local ml = UserInputService:GetMouseLocation()
+                refX = ml.X
+                refY = ml.Y
+            end
+            local dx = sp.X - refX
+            local dy = sp.Y - refY
+
             local dist3D = (cam.CFrame.Position - t.worldPos).Magnitude
-            
-            -- CORRECTION DU BUG DE PROCHE : 
-            -- Plus on est proche, plus on limite le mouvement de souris.
-            -- Loin : max 150px par frame. Proche (< 20 studs) : max 4px par frame.
             local maxStep = math_clamp(dist3D * 1.5, 4, 150)
-            
-            local smoothFactor = Config.Smoothing
-            if smoothFactor < 1 then smoothFactor = 1 end
-            
+            local smoothFactor = math_clamp(Config.Smoothing, 1, 10)
+
             local moveX = dx / smoothFactor
             local moveY = dy / smoothFactor
-            
-            -- On applique la limite dynamique
             moveX = math_clamp(moveX, -maxStep, maxStep)
             moveY = math_clamp(moveY, -maxStep, maxStep)
-            
-            -- Deadzone : si on est à moins de 2 pixels de la cible, on ne bouge plus (évite le tremblement)
+
             if math.abs(dx) < 2 and math.abs(dy) < 2 then
                 moveX = 0
                 moveY = 0
@@ -466,16 +1130,17 @@ renderConn = RunService.RenderStepped:Connect(function(_dt)
             if mousemoverel and (moveX ~= 0 or moveY ~= 0) then
                 pcall(function() mousemoverel(moveX, moveY) end)
             elseif not mousemoverel then
-                local desired=CFrame_lookAt(cam.CFrame.Position,t.worldPos)
-                cam.CFrame=cam.CFrame:Lerp(desired, 1/smoothFactor)
+                local desired = CFrame_lookAt(cam.CFrame.Position, t.worldPos)
+                local alpha = math_clamp(1 / smoothFactor, 0, 1)
+                cam.CFrame = cam.CFrame:Lerp(desired, alpha)
             end
         end
     end
 end)
 
--- ============================================================
--- GUI (Copie de ton code original)
--- ============================================================
+-- =====================================================================
+-- GUI
+-- =====================================================================
 local Colors = {
     Body      = Color3.fromRGB(22, 24, 28),
     Body2     = Color3.fromRGB(28, 31, 36),
@@ -492,12 +1157,13 @@ local Colors = {
     Enemy     = Color3.fromRGB(220, 60, 60),
     EnemyBg   = Color3.fromRGB(48, 26, 26),
 }
-local refreshers={}
-local function addRefresher(fn) table.insert(refreshers,fn) end
+local refreshers = {}
+local function addRefresher(fn) table.insert(refreshers, fn) end
 
 local function buildGui()
     local parent = LocalPlayer:WaitForChild("PlayerGui")
     pcall(function() parent = game:GetService("CoreGui") end)
+
     local gui = Instance.new("ScreenGui")
     gui.Name = "AimbotGUI"
     gui.ResetOnSpawn = false
@@ -509,12 +1175,10 @@ local function buildGui()
     local vpX = (cachedCamera and cachedCamera.ViewportSize.X) or 1920
     local PANEL_MIN_W, PANEL_MIN_H = 240, 320
     local defW, defH, defX, defY = 290, vpY - 120, -20, 60
-    local startW = SaveData.panelW or defW
-    local startH = SaveData.panelH or defH
+    local startW = math_clamp(SaveData.panelW or defW, PANEL_MIN_W, vpX - 40)
+    local startH = math_clamp(SaveData.panelH or defH, PANEL_MIN_H, vpY - 100)
     local startX = SaveData.panelX or defX
     local startY = SaveData.panelY or defY
-    startW = math_clamp(startW, PANEL_MIN_W, vpX - 40)
-    startH = math_clamp(startH, PANEL_MIN_H, vpY - 100)
 
     local panel = Instance.new("Frame")
     panel.Size = UDim2.new(0, startW, 0, startH)
@@ -583,8 +1247,12 @@ local function buildGui()
     Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
 
     local closeInfo = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-    track(closeBtn.MouseEnter:Connect(function() TweenService:Create(closeBtn, closeInfo, { BackgroundTransparency = 0, TextColor3 = Colors.Danger }):Play() end))
-    track(closeBtn.MouseLeave:Connect(function() TweenService:Create(closeBtn, closeInfo, { BackgroundTransparency = 1, TextColor3 = Colors.Muted }):Play() end))
+    track(closeBtn.MouseEnter:Connect(function()
+        TweenService:Create(closeBtn, closeInfo, { BackgroundTransparency = 0, TextColor3 = Colors.Danger }):Play()
+    end))
+    track(closeBtn.MouseLeave:Connect(function()
+        TweenService:Create(closeBtn, closeInfo, { BackgroundTransparency = 1, TextColor3 = Colors.Muted }):Play()
+    end))
     track(closeBtn.MouseButton1Click:Connect(function() cleanup() end))
 
     local divider = Instance.new("Frame")
@@ -651,9 +1319,33 @@ local function buildGui()
     Instance.new("UICorner", resizeGrip).CornerRadius = UDim.new(0, 4)
 
     local resizing, resizeStart, resizeStartSize = false, nil, nil
-    track(resizeGrip.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then resizing = true; resizeStart = input.Position; resizeStartSize = panel.Size end end))
-    track(UserInputService.InputChanged:Connect(function(input) if resizing and input.UserInputType == Enum.UserInputType.MouseMovement then local d = input.Position - resizeStart; local curVpX = (cachedCamera and cachedCamera.ViewportSize.X) or vpX; local curVpY = (cachedCamera and cachedCamera.ViewportSize.Y) or vpY; local newW = math_clamp(resizeStartSize.X.Offset - d.X, PANEL_MIN_W, curVpX - 40); local newH = math_clamp(resizeStartSize.Y.Offset + d.Y, PANEL_MIN_H, curVpY - 100); panel.Size = UDim2.new(0, newW, 0, newH) end end))
-    track(UserInputService.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then if resizing then SaveData.panelW = panel.Size.X.Offset; SaveData.panelH = panel.Size.Y.Offset; saveSoon() end; resizing = false end end))
+    track(resizeGrip.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            resizing = true
+            resizeStart = input.Position
+            resizeStartSize = panel.Size
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if resizing and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = input.Position - resizeStart
+            local curVpX = (cachedCamera and cachedCamera.ViewportSize.X) or vpX
+            local curVpY = (cachedCamera and cachedCamera.ViewportSize.Y) or vpY
+            local newW = math_clamp(resizeStartSize.X.Offset - d.X, PANEL_MIN_W, curVpX - 40)
+            local newH = math_clamp(resizeStartSize.Y.Offset + d.Y, PANEL_MIN_H, curVpY - 100)
+            panel.Size = UDim2.new(0, newW, 0, newH)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if resizing then
+                SaveData.panelW = panel.Size.X.Offset
+                SaveData.panelH = panel.Size.Y.Offset
+                saveSoon()
+            end
+            resizing = false
+        end
+    end))
 
     local function section(text, order)
         local row = Instance.new("Frame")
@@ -680,7 +1372,7 @@ local function buildGui()
         line.Parent = row
     end
 
-    local function makeToggle(text, key, order, bindField, disabledBy)
+    local function makeToggle(text, key, order, bindField, disabledBy, onChange)
         local row = Instance.new("TextButton")
         row.Size = UDim2.new(1, 0, 0, 30)
         row.BackgroundColor3 = Colors.Surface
@@ -690,6 +1382,7 @@ local function buildGui()
         row.LayoutOrder = order
         row.Parent = content
         Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
         local lbl = Instance.new("TextLabel")
         lbl.Size = UDim2.new(1, -(bindField and 96 or 60), 1, 0)
         lbl.Position = UDim2.new(0, 10, 0, 0)
@@ -700,7 +1393,9 @@ local function buildGui()
         lbl.Font = Enum.Font.Gotham
         lbl.TextSize = 12
         lbl.Parent = row
+
         local info = TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
         if bindField then
             local kb = Instance.new("TextButton")
             kb.Size = UDim2.new(0, 34, 0, 18)
@@ -718,13 +1413,27 @@ local function buildGui()
             kbStroke.Color = Colors.Stroke
             kbStroke.Thickness = 1
             addRefresher(function()
-                if rebinding == bindField then kb.Text = "..."; kb.TextColor3 = Colors.Accent; kbStroke.Color = Colors.Accent
-                else kb.Text = bindLabel(Config[bindField]); kb.TextColor3 = Colors.Muted; kbStroke.Color = Colors.Stroke end
+                if rebinding == bindField then
+                    kb.Text = "..."
+                    kb.TextColor3 = Colors.Accent
+                    kbStroke.Color = Colors.Accent
+                else
+                    kb.Text = bindLabel(Config[bindField])
+                    kb.TextColor3 = Colors.Muted
+                    kbStroke.Color = Colors.Stroke
+                end
             end)
-            track(kb.MouseEnter:Connect(function() TweenService:Create(kb, info, { BackgroundTransparency = 0 }):Play() end))
-            track(kb.MouseLeave:Connect(function() TweenService:Create(kb, info, { BackgroundTransparency = 1 }):Play() end))
-            track(kb.MouseButton1Click:Connect(function() rebinding = (rebinding == bindField) and nil or bindField end))
+            track(kb.MouseEnter:Connect(function()
+                TweenService:Create(kb, info, { BackgroundTransparency = 0 }):Play()
+            end))
+            track(kb.MouseLeave:Connect(function()
+                TweenService:Create(kb, info, { BackgroundTransparency = 1 }):Play()
+            end))
+            track(kb.MouseButton1Click:Connect(function()
+                rebinding = (rebinding == bindField) and nil or bindField
+            end))
         end
+
         local sw = Instance.new("Frame")
         sw.Size = UDim2.new(0, 34, 0, 18)
         sw.Position = UDim2.new(1, -44, 0.5, -9)
@@ -735,6 +1444,7 @@ local function buildGui()
         local swStroke = Instance.new("UIStroke", sw)
         swStroke.Color = Colors.Stroke
         swStroke.Thickness = 1
+
         local knob = Instance.new("Frame")
         knob.Size = UDim2.new(0, 14, 0, 14)
         knob.Position = UDim2.new(0, 2, 0.5, -7)
@@ -742,6 +1452,7 @@ local function buildGui()
         knob.BorderSizePixel = 0
         knob.Parent = sw
         Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
         local lastOn, lastDisabled = nil, nil
         local function render(animate)
             local on = Config[key]
@@ -752,15 +1463,41 @@ local function buildGui()
             local targetColor = on and Colors.Accent or Colors.Surface2
             local targetKnob  = on and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(180, 186, 194)
             local targetPos   = on and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
-            if animate then TweenService:Create(sw, info, { BackgroundColor3 = targetColor }):Play(); TweenService:Create(knob, info, { BackgroundColor3 = targetKnob, Position = targetPos }):Play()
-            else sw.BackgroundColor3 = targetColor; knob.BackgroundColor3 = targetKnob; knob.Position = targetPos end
-            if disabled then lbl.TextTransparency = 0.55; sw.BackgroundTransparency = 0.55; knob.BackgroundTransparency = 0.4
-            else lbl.TextTransparency = 0; sw.BackgroundTransparency = 0; knob.BackgroundTransparency = 0 end
+            if animate then
+                TweenService:Create(sw, info, { BackgroundColor3 = targetColor }):Play()
+                TweenService:Create(knob, info, { BackgroundColor3 = targetKnob, Position = targetPos }):Play()
+            else
+                sw.BackgroundColor3 = targetColor
+                knob.BackgroundColor3 = targetKnob
+                knob.Position = targetPos
+            end
+            if disabled then
+                lbl.TextTransparency = 0.55
+                sw.BackgroundTransparency = 0.55
+                knob.BackgroundTransparency = 0.4
+            else
+                lbl.TextTransparency = 0
+                sw.BackgroundTransparency = 0
+                knob.BackgroundTransparency = 0
+            end
         end
-        render(false); addRefresher(function() render(true) end)
-        track(row.MouseEnter:Connect(function() if disabledBy and disabledBy() then return end; TweenService:Create(row, info, { BackgroundTransparency = 0 }):Play() end))
-        track(row.MouseLeave:Connect(function() TweenService:Create(row, info, { BackgroundTransparency = 1 }):Play() end))
-        track(row.MouseButton1Click:Connect(function() if disabledBy and disabledBy() then return end; Config[key] = not Config[key]; render(true); saveSoon() end))
+        render(false)
+        addRefresher(function() render(true) end)
+
+        track(row.MouseEnter:Connect(function()
+            if disabledBy and disabledBy() then return end
+            TweenService:Create(row, info, { BackgroundTransparency = 0 }):Play()
+        end))
+        track(row.MouseLeave:Connect(function()
+            TweenService:Create(row, info, { BackgroundTransparency = 1 }):Play()
+        end))
+        track(row.MouseButton1Click:Connect(function()
+            if disabledBy and disabledBy() then return end
+            Config[key] = not Config[key]
+            render(true)
+            saveSoon()
+            if onChange then pcall(onChange) end
+        end))
     end
 
     local function makeSlider(text, min, max, getter, setter, fmt, order)
@@ -769,6 +1506,7 @@ local function buildGui()
         box.BackgroundTransparency = 1
         box.LayoutOrder = order
         box.Parent = content
+
         local lbl = Instance.new("TextLabel")
         lbl.Size = UDim2.new(1, -60, 0, 16)
         lbl.Position = UDim2.new(0, 2, 0, 0)
@@ -779,6 +1517,7 @@ local function buildGui()
         lbl.Font = Enum.Font.Gotham
         lbl.TextSize = 12
         lbl.Parent = box
+
         local val = Instance.new("TextLabel")
         val.Size = UDim2.new(0, 60, 0, 16)
         val.Position = UDim2.new(1, -60, 0, 0)
@@ -789,6 +1528,7 @@ local function buildGui()
         val.Font = Enum.Font.GothamMedium
         val.TextSize = 12
         val.Parent = box
+
         local trackFrame = Instance.new("Frame")
         trackFrame.Size = UDim2.new(1, -4, 0, 6)
         trackFrame.Position = UDim2.new(0, 2, 0, 28)
@@ -796,6 +1536,7 @@ local function buildGui()
         trackFrame.BorderSizePixel = 0
         trackFrame.Parent = box
         Instance.new("UICorner", trackFrame).CornerRadius = UDim.new(1, 0)
+
         local fill = Instance.new("Frame")
         fill.Size = UDim2.new((getter() - min) / (max - min), 0, 1, 0)
         fill.BackgroundColor3 = Colors.Accent
@@ -804,6 +1545,7 @@ local function buildGui()
         Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
         local fillGrad = Instance.new("UIGradient", fill)
         fillGrad.Color = ColorSequence.new(Colors.AccentDim, Colors.Accent)
+
         local glow = Instance.new("Frame")
         glow.AnchorPoint = Vector2.new(0.5, 0.5)
         glow.Size = UDim2.new(0, 18, 0, 18)
@@ -813,6 +1555,7 @@ local function buildGui()
         glow.BorderSizePixel = 0
         glow.Parent = trackFrame
         Instance.new("UICorner", glow).CornerRadius = UDim.new(1, 0)
+
         local knob = Instance.new("Frame")
         knob.AnchorPoint = Vector2.new(0.5, 0.5)
         knob.Size = UDim2.new(0, 12, 0, 12)
@@ -821,6 +1564,7 @@ local function buildGui()
         knob.BorderSizePixel = 0
         knob.Parent = trackFrame
         Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
         local dragging = false
         local function apply(r)
             r = math_clamp(r, 0, 1)
@@ -836,9 +1580,23 @@ local function buildGui()
             if aw <= 0 then return end
             apply((mx - ax) / aw)
         end
-        track(trackFrame.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true; applyMouse(input.Position.X) end end))
-        track(UserInputService.InputChanged:Connect(function(input) if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then applyMouse(input.Position.X) end end))
-        track(UserInputService.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then if dragging then saveSoon() end; dragging = false end end))
+        track(trackFrame.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = true
+                applyMouse(input.Position.X)
+            end
+        end))
+        track(UserInputService.InputChanged:Connect(function(input)
+            if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+                applyMouse(input.Position.X)
+            end
+        end))
+        track(UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                if dragging then saveSoon() end
+                dragging = false
+            end
+        end))
     end
 
     local function makeCycle(text, get, cycle, order)
@@ -851,6 +1609,7 @@ local function buildGui()
         btn.LayoutOrder = order
         btn.Parent = content
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
         local lbl = Instance.new("TextLabel")
         lbl.Size = UDim2.new(0.5, 0, 1, 0)
         lbl.Position = UDim2.new(0, 10, 0, 0)
@@ -861,6 +1620,7 @@ local function buildGui()
         lbl.Font = Enum.Font.Gotham
         lbl.TextSize = 12
         lbl.Parent = btn
+
         local chev = Instance.new("TextLabel")
         chev.AnchorPoint = Vector2.new(1, 0.5)
         chev.Size = UDim2.new(0, 12, 1, 0)
@@ -871,6 +1631,7 @@ local function buildGui()
         chev.Font = Enum.Font.GothamBold
         chev.TextSize = 14
         chev.Parent = btn
+
         local val = Instance.new("TextLabel")
         val.Size = UDim2.new(0.5, -28, 1, 0)
         val.Position = UDim2.new(0.5, 0, 0, 0)
@@ -881,10 +1642,19 @@ local function buildGui()
         val.Font = Enum.Font.GothamMedium
         val.TextSize = 12
         val.Parent = btn
+
         local info = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-        track(btn.MouseEnter:Connect(function() TweenService:Create(btn, info, { BackgroundTransparency = 0 }):Play() end))
-        track(btn.MouseLeave:Connect(function() TweenService:Create(btn, info, { BackgroundTransparency = 1 }):Play() end))
-        track(btn.MouseButton1Click:Connect(function() cycle(); val.Text = get(); saveSoon() end))
+        track(btn.MouseEnter:Connect(function()
+            TweenService:Create(btn, info, { BackgroundTransparency = 0 }):Play()
+        end))
+        track(btn.MouseLeave:Connect(function()
+            TweenService:Create(btn, info, { BackgroundTransparency = 1 }):Play()
+        end))
+        track(btn.MouseButton1Click:Connect(function()
+            cycle()
+            val.Text = get()
+            saveSoon()
+        end))
     end
 
     local function makeTeamsSection(order)
@@ -897,6 +1667,7 @@ local function buildGui()
         container.ClipsDescendants = true
         container.Parent = content
         Instance.new("UICorner", container).CornerRadius = UDim.new(0, 6)
+
         local scroll = Instance.new("ScrollingFrame")
         scroll.Size = UDim2.new(1, 0, 1, 0)
         scroll.BackgroundTransparency = 1
@@ -907,23 +1678,29 @@ local function buildGui()
         scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
         scroll.ScrollingDirection = Enum.ScrollingDirection.Y
         scroll.Parent = container
+
         local padding = Instance.new("UIPadding", scroll)
         padding.PaddingLeft = UDim.new(0, 5)
         padding.PaddingRight = UDim.new(0, 5)
         padding.PaddingTop = UDim.new(0, 5)
         padding.PaddingBottom = UDim.new(0, 5)
+
         local layout = Instance.new("UIListLayout", scroll)
         layout.Padding = UDim.new(0, 4)
         layout.SortOrder = Enum.SortOrder.LayoutOrder
+
         local rows = {}
         local function collectTeams()
             local set = {}
-            for _, plr in ipairs(Players:GetPlayers()) do if plr ~= LocalPlayer then set[teamKeyOf(plr)] = true end end
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LocalPlayer then set[teamKeyOf(plr)] = true end
+            end
             local arr = {}
             for k in pairs(set) do arr[#arr + 1] = k end
             table_sort(arr)
             return arr
         end
+
         local function rebuild()
             for _, r in ipairs(rows) do pcall(function() r:Destroy() end) end
             rows = {}
@@ -948,6 +1725,7 @@ local function buildGui()
                 row.LayoutOrder = i
                 row.Parent = scroll
                 Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+
                 local nameLbl = Instance.new("TextLabel")
                 nameLbl.Size = UDim2.new(1, -60, 1, 0)
                 nameLbl.Position = UDim2.new(0, 8, 0, 0)
@@ -959,6 +1737,7 @@ local function buildGui()
                 nameLbl.TextSize = 11
                 nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
                 nameLbl.Parent = row
+
                 local tBtn = Instance.new("TextButton")
                 tBtn.Size = UDim2.new(0, 44, 1, -8)
                 tBtn.Position = UDim2.new(1, -48, 0, 4)
@@ -971,20 +1750,54 @@ local function buildGui()
                 tBtn.TextColor3 = Colors.Muted
                 tBtn.Parent = row
                 Instance.new("UICorner", tBtn).CornerRadius = UDim.new(0, 4)
+
                 local function render()
-                    if SelectedTeams[key] then row.BackgroundColor3 = Colors.FriendBg; tBtn.BackgroundColor3 = Colors.Friend; tBtn.TextColor3 = Color3.fromRGB(255, 255, 255); tBtn.Text = "ON"
-                    else row.BackgroundColor3 = Colors.Surface2; tBtn.BackgroundColor3 = Colors.Surface; tBtn.TextColor3 = Colors.Muted; tBtn.Text = "OFF" end
+                    if SelectedTeams[key] then
+                        row.BackgroundColor3 = Colors.FriendBg
+                        tBtn.BackgroundColor3 = Colors.Friend
+                        tBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        tBtn.Text = "ON"
+                    else
+                        row.BackgroundColor3 = Colors.Surface2
+                        tBtn.BackgroundColor3 = Colors.Surface
+                        tBtn.TextColor3 = Colors.Muted
+                        tBtn.Text = "OFF"
+                    end
                 end
-                track(tBtn.MouseButton1Click:Connect(function() if SelectedTeams[key] then SelectedTeams[key] = nil else SelectedTeams[key] = true end; recalcTeamFilter(); saveTeams(); render() end))
+                track(tBtn.MouseButton1Click:Connect(function()
+                    if SelectedTeams[key] then
+                        SelectedTeams[key] = nil
+                    else
+                        SelectedTeams[key] = true
+                    end
+                    recalcTeamFilter()
+                    saveTeams()
+                    render()
+                end))
                 render()
                 rows[#rows + 1] = row
             end
         end
         rebuild()
-        local function hookTeam(plr) track(plr:GetPropertyChangedSignal("Team"):Connect(function() task_wait(0.05); if not closed then rebuild() end end)) end
-        for _, plr in ipairs(Players:GetPlayers()) do if plr ~= LocalPlayer then hookTeam(plr) end end
-        track(Players.PlayerAdded:Connect(function(plr) hookTeam(plr); task_wait(0.2); if not closed then rebuild() end end))
-        track(Players.PlayerRemoving:Connect(function() task_wait(0.2); if not closed then rebuild() end end))
+
+        local function hookTeam(plr)
+            track(plr:GetPropertyChangedSignal("Team"):Connect(function()
+                task_wait(0.05)
+                if not closed then rebuild() end
+            end))
+        end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then hookTeam(plr) end
+        end
+        track(Players.PlayerAdded:Connect(function(plr)
+            hookTeam(plr)
+            task_wait(0.2)
+            if not closed then rebuild() end
+        end))
+        track(Players.PlayerRemoving:Connect(function()
+            task_wait(0.2)
+            if not closed then rebuild() end
+        end))
         return container
     end
 
@@ -998,6 +1811,7 @@ local function buildGui()
         container.ClipsDescendants = true
         container.Parent = content
         Instance.new("UICorner", container).CornerRadius = UDim.new(0, 6)
+
         local search = Instance.new("TextBox")
         search.Size = UDim2.new(1, -10, 0, 24)
         search.Position = UDim2.new(0, 5, 0, 5)
@@ -1015,6 +1829,7 @@ local function buildGui()
         Instance.new("UICorner", search).CornerRadius = UDim.new(0, 4)
         local spad = Instance.new("UIPadding", search)
         spad.PaddingLeft = UDim.new(0, 8)
+
         local scroll = Instance.new("ScrollingFrame")
         scroll.Size = UDim2.new(1, 0, 1, -34)
         scroll.Position = UDim2.new(0, 0, 0, 34)
@@ -1026,25 +1841,56 @@ local function buildGui()
         scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
         scroll.ScrollingDirection = Enum.ScrollingDirection.Y
         scroll.Parent = container
+
         local padding = Instance.new("UIPadding", scroll)
         padding.PaddingLeft = UDim.new(0, 5)
         padding.PaddingRight = UDim.new(0, 5)
         padding.PaddingTop = UDim.new(0, 5)
         padding.PaddingBottom = UDim.new(0, 5)
+
         local rowLayout = Instance.new("UIListLayout", scroll)
         rowLayout.Padding = UDim.new(0, 4)
         rowLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
         local rows = {}
-        local function getQuery() local t = search.Text; if type(t) ~= "string" then return "" end; t = t:lower(); t = t:gsub("^%s+", ""):gsub("%s+$", ""); return t end
+        local function getQuery()
+            local t = search.Text
+            if type(t) ~= "string" then return "" end
+            t = t:lower()
+            t = t:gsub("^%s+", ""):gsub("%s+$", "")
+            return t
+        end
         local function reorderByQuery()
             local q = getQuery()
-            if q == "" then for i, entry in ipairs(rows) do entry.row.LayoutOrder = i; entry.nameLbl.TextColor3 = Colors.Text end; scroll.CanvasPosition = Vector2_new(0, 0); return end
+            if q == "" then
+                for i, entry in ipairs(rows) do
+                    entry.row.LayoutOrder = i
+                    entry.nameLbl.TextColor3 = Colors.Text
+                end
+                scroll.CanvasPosition = Vector2_new(0, 0)
+                return
+            end
             local scored = {}
-            for i = 1, #rows do local entry = rows[i]; local name = entry.plr.Name:lower(); local score = levenshtein(q, name); if name:find(q, 1, true) then score = score - 1000 end; scored[#scored + 1] = { entry = entry, score = score } end
+            for i = 1, #rows do
+                local entry = rows[i]
+                local name = entry.plr.Name:lower()
+                local score = levenshtein(q, name)
+                if name:find(q, 1, true) then score = score - 1000 end
+                scored[#scored + 1] = { entry = entry, score = score }
+            end
             table_sort(scored, function(a, b) return a.score < b.score end)
-            for i = 1, #scored do local s = scored[i]; s.entry.row.LayoutOrder = i; if i == 1 then s.entry.nameLbl.TextColor3 = Colors.Accent else s.entry.nameLbl.TextColor3 = Colors.Text end end
+            for i = 1, #scored do
+                local s = scored[i]
+                s.entry.row.LayoutOrder = i
+                if i == 1 then
+                    s.entry.nameLbl.TextColor3 = Colors.Accent
+                else
+                    s.entry.nameLbl.TextColor3 = Colors.Text
+                end
+            end
             scroll.CanvasPosition = Vector2_new(0, 0)
         end
+
         local function rebuildPlayerRows()
             for _, entry in ipairs(rows) do pcall(function() entry.row:Destroy() end) end
             rows = {}
@@ -1059,6 +1905,7 @@ local function buildGui()
                     row.LayoutOrder = idx
                     row.Parent = scroll
                     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+
                     local nameLbl = Instance.new("TextLabel")
                     nameLbl.Size = UDim2.new(1, -66, 1, 0)
                     nameLbl.Position = UDim2.new(0, 8, 0, 0)
@@ -1070,25 +1917,76 @@ local function buildGui()
                     nameLbl.TextSize = 11
                     nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
                     nameLbl.Parent = row
-                    local function miniBtn(txt, xOff) local b = Instance.new("TextButton"); b.Size = UDim2.new(0, 22, 1, -8); b.Position = UDim2.new(1, xOff, 0, 4); b.BackgroundColor3 = Colors.Surface; b.BorderSizePixel = 0; b.AutoButtonColor = false; b.Text = txt; b.Font = Enum.Font.GothamBold; b.TextSize = 11; b.TextColor3 = Colors.Muted; b.Parent = row; Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4); return b end
-                    local fBtn = miniBtn("F", -52); local eBtn = miniBtn("E", -26)
+
+                    local function miniBtn(txt, xOff)
+                        local b = Instance.new("TextButton")
+                        b.Size = UDim2.new(0, 22, 1, -8)
+                        b.Position = UDim2.new(1, xOff, 0, 4)
+                        b.BackgroundColor3 = Colors.Surface
+                        b.BorderSizePixel = 0
+                        b.AutoButtonColor = false
+                        b.Text = txt
+                        b.Font = Enum.Font.GothamBold
+                        b.TextSize = 11
+                        b.TextColor3 = Colors.Muted
+                        b.Parent = row
+                        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+                        return b
+                    end
+                    local fBtn = miniBtn("F", -52)
+                    local eBtn = miniBtn("E", -26)
+
                     local function render()
                         local state = PlayerPrefs[tostring(plr.UserId)]
-                        if state == "friend" then row.BackgroundColor3 = Colors.FriendBg; fBtn.BackgroundColor3 = Colors.Friend; fBtn.TextColor3 = Color3.fromRGB(255, 255, 255); eBtn.BackgroundColor3 = Colors.Surface; eBtn.TextColor3 = Colors.Muted
-                        elseif state == "enemy" then row.BackgroundColor3 = Colors.EnemyBg; fBtn.BackgroundColor3 = Colors.Surface; fBtn.TextColor3 = Colors.Muted; eBtn.BackgroundColor3 = Colors.Enemy; eBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-                        else row.BackgroundColor3 = Colors.Surface2; fBtn.BackgroundColor3 = Colors.Surface; fBtn.TextColor3 = Colors.Muted; eBtn.BackgroundColor3 = Colors.Surface; eBtn.TextColor3 = Colors.Muted end
+                        if state == "friend" then
+                            row.BackgroundColor3 = Colors.FriendBg
+                            fBtn.BackgroundColor3 = Colors.Friend
+                            fBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                            eBtn.BackgroundColor3 = Colors.Surface
+                            eBtn.TextColor3 = Colors.Muted
+                        elseif state == "enemy" then
+                            row.BackgroundColor3 = Colors.EnemyBg
+                            fBtn.BackgroundColor3 = Colors.Surface
+                            fBtn.TextColor3 = Colors.Muted
+                            eBtn.BackgroundColor3 = Colors.Enemy
+                            eBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        else
+                            row.BackgroundColor3 = Colors.Surface2
+                            fBtn.BackgroundColor3 = Colors.Surface
+                            fBtn.TextColor3 = Colors.Muted
+                            eBtn.BackgroundColor3 = Colors.Surface
+                            eBtn.TextColor3 = Colors.Muted
+                        end
                     end
-                    local function setState(target) local key = tostring(plr.UserId); if PlayerPrefs[key] == target then PlayerPrefs[key] = nil else PlayerPrefs[key] = target end; render(); savePrefs() end
-                    track(fBtn.MouseButton1Click:Connect(function() setState("friend") end)); track(eBtn.MouseButton1Click:Connect(function() setState("enemy")  end))
-                    render(); rows[#rows + 1] = { plr = plr, row = row, nameLbl = nameLbl }
+                    local function setState(target)
+                        local key = tostring(plr.UserId)
+                        if PlayerPrefs[key] == target then
+                            PlayerPrefs[key] = nil
+                        else
+                            PlayerPrefs[key] = target
+                        end
+                        render()
+                        savePrefs()
+                    end
+                    track(fBtn.MouseButton1Click:Connect(function() setState("friend") end))
+                    track(eBtn.MouseButton1Click:Connect(function() setState("enemy") end))
+                    render()
+                    rows[#rows + 1] = { plr = plr, row = row, nameLbl = nameLbl }
                 end
             end
             reorderByQuery()
         end
+
         track(search:GetPropertyChangedSignal("Text"):Connect(reorderByQuery))
         rebuildPlayerRows()
-        track(Players.PlayerAdded:Connect(function() task_wait(0.2); if not closed then rebuildPlayerRows() end end))
-        track(Players.PlayerRemoving:Connect(function() task_wait(0.2); if not closed then rebuildPlayerRows() end end))
+        track(Players.PlayerAdded:Connect(function()
+            task_wait(0.2)
+            if not closed then rebuildPlayerRows() end
+        end))
+        track(Players.PlayerRemoving:Connect(function()
+            task_wait(0.2)
+            if not closed then rebuildPlayerRows() end
+        end))
         return container
     end
 
@@ -1096,15 +1994,15 @@ local function buildGui()
     local function nextOrder() order = order + 1; return order end
 
     section("general", nextOrder())
-    makeToggle("enabled",       "Enabled",      nextOrder(), "AimbotBind", function() return Config.HoldToAim end)
-    makeToggle("hold to aim",   "HoldToAim",    nextOrder())
-    makeToggle("team check",    "TeamCheck",    nextOrder())
+    makeToggle("enabled", "Enabled", nextOrder(), "AimbotBind", function() return Config.HoldToAim end)
+    makeToggle("hold to aim", "HoldToAim", nextOrder())
+    makeToggle("team check", "TeamCheck", nextOrder())
     makeToggle("visible check", "VisibleCheck", nextOrder())
 
     section("targets", nextOrder())
-    makeToggle("players",       "TargetPlayers", nextOrder())
-    makeToggle("npc",           "TargetNPCs",    nextOrder())
-    makeToggle("enemy only",    "EnemyOnly",     nextOrder())
+    makeToggle("players", "TargetPlayers", nextOrder(), nil, nil, function() markDirty() end)
+    makeToggle("npc", "TargetNPCs", nextOrder(), nil, nil, function() markDirty() end)
+    makeToggle("enemy only", "EnemyOnly", nextOrder())
 
     section("teams  ·  whitelist", nextOrder())
     makeTeamsSection(nextOrder())
@@ -1113,22 +2011,60 @@ local function buildGui()
     makePlayerPrefsSection(nextOrder())
 
     section("tuning", nextOrder())
-    makeSlider("fov",        50, 500, function() return Config.FOVRadius end, function(v) Config.FOVRadius = v end, function(v) return string.format("%d", v) end, nextOrder())
-    makeSlider("smoothing",  1, 10, function() return Config.Smoothing end, function(v) Config.Smoothing = v end, function(v) return string.format("%.1f", v) end, nextOrder())
-    makeSlider("prediction", 0, 0.5, function() return Config.Prediction end, function(v) Config.Prediction = v end, function(v) return string.format("%.3f", v) end, nextOrder())
-    makeSlider("hrp jitter", 0, 2, function() return Config.HRPJitterRadius end, function(v) Config.HRPJitterRadius = v end, function(v) return string.format("%.2f", v) end, nextOrder())
+    makeSlider("fov", 50, 500, function() return Config.FOVRadius end, function(v) Config.FOVRadius = v end,
+        function(v) return string.format("%d", v) end, nextOrder())
+    makeSlider("smoothing", 1, 10, function() return Config.Smoothing end, function(v) Config.Smoothing = v end,
+        function(v) return string.format("%.1f", v) end, nextOrder())
+    makeSlider("prediction", 0, 0.5, function() return Config.Prediction end, function(v) Config.Prediction = v end,
+        function(v) return string.format("%.3f", v) end, nextOrder())
+    makeSlider("hrp jitter", 0, 2, function() return Config.HRPJitterRadius end, function(v) Config.HRPJitterRadius = v end,
+        function(v) return string.format("%.2f", v) end, nextOrder())
 
     section("aim", nextOrder())
     local parts = { "HumanoidRootPart", "UpperTorso", "Head", "Torso" }
     local idx = 1
-    for i, p in ipairs(parts) do if p == Config.TargetPart then idx = i end end
-    makeCycle("part", function() return Config.TargetPart end, function() idx = idx % #parts + 1; Config.TargetPart = parts[idx]; table_clear(partCache) end, nextOrder())
-    makeCycle("mode", function() return Config.TargetMode end, function() Config.TargetMode = (Config.TargetMode == "Mouse") and "Center" or "Mouse" end, nextOrder())
+    for i, p in ipairs(parts) do
+        if p == Config.TargetPart then idx = i end
+    end
+    makeCycle("part", function() return Config.TargetPart end, function()
+        idx = idx % #parts + 1
+        Config.TargetPart = parts[idx]
+        table_clear(partCache)
+    end, nextOrder())
+    makeCycle("mode", function() return Config.TargetMode end, function()
+        Config.TargetMode = (Config.TargetMode == "Mouse") and "Center" or "Mouse"
+    end, nextOrder())
+    makeCycle("aim mode (camera / remote)", function() return Config.AimMode end, function()
+        Config.AimMode = (Config.AimMode == "Camera") and "Remote" or "Camera"
+        syncRemoteAim()
+    end, nextOrder())
 
     local dragging, dragStart, startPos = false, nil, nil
-    track(titleBar.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true; dragStart = input.Position; startPos = panel.Position end end))
-    track(UserInputService.InputChanged:Connect(function(input) if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then local d = input.Position - dragStart; panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y) end end))
-    track(UserInputService.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then if dragging then SaveData.panelX = panel.Position.X.Offset; SaveData.panelY = panel.Position.Y.Offset; saveSoon() end; dragging = false end end))
+    track(titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = panel.Position
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = input.Position - dragStart
+            panel.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if dragging then
+                SaveData.panelX = panel.Position.X.Offset
+                SaveData.panelY = panel.Position.Y.Offset
+                saveSoon()
+            end
+            dragging = false
+        end
+    end))
 
     guiConn = task_spawn(function()
         while not closed do
@@ -1143,6 +2079,17 @@ local function buildGui()
 end
 
 pcall(buildGui)
-task.defer(function() local ok, err = pcall(rebuildCandidates); if not ok and err then warn("[Aimbot] rebuild failed: " .. tostring(err)); candidateDirty = true end end)
 
-print("[Aimbot] Loaded. Toggle: " .. bindLabel(Config.AimbotBind) .. " | NPC: on | M4/M5 | prefs: F(green) E(red) | teams: whitelist")
+task.defer(function()
+    local ok, err = pcall(rebuildCandidates)
+    if not ok and err then
+        warn("[Aimbot] rebuild failed: " .. tostring(err))
+        candidateDirty = true
+    end
+end)
+
+syncRemoteAim()
+
+print("[Aimbot] Loaded. Toggle: " .. bindLabel(Config.AimbotBind) ..
+    " | AimMode: " .. Config.AimMode ..
+    " | Remote hooks: " .. tostring(RemoteAim.hookInstalled))
