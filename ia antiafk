@@ -1,0 +1,321 @@
+local okGenv, genv = pcall(function() return getgenv() end)
+local env = (okGenv and type(genv) == "table") and genv or _G
+
+if env.__XENO_ANTIAFK_LOADED or _G.__XENO_ANTIAFK_LOADED then
+    print("[AntiAFK] already loaded")
+    return
+end
+
+env.__XENO_ANTIAFK_LOADED = true
+_G.__XENO_ANTIAFK_LOADED = true
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+local ENABLE_CAMERA_FALLBACK = false
+local SHORT_THROTTLE = 0.5
+local enabled = true
+local lastTrigger = 0
+local triggerCount = 0
+local idledConnection = nil
+local keyConnection = nil
+local cameraFallbackActive = false
+
+local VirtualUser = nil
+pcall(function() VirtualUser = game:GetService("VirtualUser") end)
+
+-- ============================================================
+-- GUI
+-- ============================================================
+local function resolveGuiParent()
+    local ok, hui = pcall(function() return gethui() end)
+    if ok and hui then return hui end
+    local ok2, cg = pcall(function() return game:GetService("CoreGui") end)
+    if ok2 and cg then return cg end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "XenoAntiAFK"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.IgnoreGuiInset = true
+
+local parented = pcall(function()
+    screenGui.Parent = resolveGuiParent()
+end)
+if not parented or not screenGui.Parent then
+    screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.new(0, 280, 0, 200)
+main.Position = UDim2.new(0.5, -140, 0.5, -100)
+main.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+main.BorderSizePixel = 0
+main.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 8)
+mainCorner.Parent = main
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(60, 60, 75)
+mainStroke.Thickness = 1
+mainStroke.Parent = main
+
+-- Title bar
+local titleBar = Instance.new("Frame")
+titleBar.Name = "TitleBar"
+titleBar.Size = UDim2.new(1, 0, 0, 36)
+titleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 8)
+titleCorner.Parent = titleBar
+
+local titleFix = Instance.new("Frame")
+titleFix.Size = UDim2.new(1, 0, 0, 8)
+titleFix.Position = UDim2.new(0, 0, 1, -8)
+titleFix.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+titleFix.BorderSizePixel = 0
+titleFix.Parent = titleBar
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -16, 1, 0)
+title.Position = UDim2.new(0, 12, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "Xeno Anti-AFK"
+title.TextColor3 = Color3.fromRGB(230, 230, 240)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = titleBar
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -32, 0, 22)
+statusLabel.Position = UDim2.new(0, 16, 0, 46)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Status: Enabled"
+statusLabel.TextColor3 = Color3.fromRGB(90, 220, 130)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 13
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = main
+
+local countLabel = Instance.new("TextLabel")
+countLabel.Size = UDim2.new(1, -32, 0, 18)
+countLabel.Position = UDim2.new(0, 16, 0, 72)
+countLabel.BackgroundTransparency = 1
+countLabel.Text = "Triggers: 0"
+countLabel.TextColor3 = Color3.fromRGB(160, 160, 180)
+countLabel.Font = Enum.Font.Gotham
+countLabel.TextSize = 12
+countLabel.TextXAlignment = Enum.TextXAlignment.Left
+countLabel.Parent = main
+
+local function makeButton(text, pos, bg, size)
+    local btn = Instance.new("TextButton")
+    btn.Size = size or UDim2.new(0, 118, 0, 34)
+    btn.Position = pos
+    btn.BackgroundColor3 = bg
+    btn.BorderSizePixel = 0
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 12
+    btn.AutoButtonColor = false
+    btn.Parent = main
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent = btn
+    return btn
+end
+
+local toggleBtn = makeButton("ON", UDim2.new(0, 16, 0, 104), Color3.fromRGB(60, 170, 90))
+local camBtn = makeButton("Cam: OFF", UDim2.new(0, 146, 0, 104), Color3.fromRGB(60, 60, 75))
+camBtn.Font = Enum.Font.Gotham
+local stopBtn = makeButton("Stop", UDim2.new(0, 16, 0, 154), Color3.fromRGB(180, 60, 60), UDim2.new(1, -32, 0, 30))
+
+-- ============================================================
+-- Notification
+-- ============================================================
+local function notify(titleText, text)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = titleText, Text = text, Duration = 2
+        })
+    end)
+end
+
+-- ============================================================
+-- Camera fallback
+-- ============================================================
+local function cameraFallback()
+    if cameraFallbackActive then return end
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    cameraFallbackActive = true
+    local originalCFrame = camera.CFrame
+    local startTime = os.clock()
+    local conn
+    conn = RunService.RenderStepped:Connect(function()
+        if os.clock() - startTime < 0.06 then
+            camera.CFrame = originalCFrame * CFrame.Angles(0, math.rad(0.35), 0)
+        else
+            camera.CFrame = originalCFrame
+            cameraFallbackActive = false
+            if conn then conn:Disconnect(); conn = nil end
+        end
+    end)
+end
+
+-- ============================================================
+-- Click chain
+-- ============================================================
+local function performClick()
+    if VirtualUser then
+        pcall(function() VirtualUser:CaptureController() end)
+        if pcall(function() VirtualUser:ClickButton2(Vector2.new()) end) then return true end
+        if pcall(function() VirtualUser:ClickButton1(Vector2.new()) end) then return true end
+        local downOk = pcall(function() VirtualUser:Button1Down(Vector2.new()) end)
+        if downOk then
+            task.wait(0.03)
+            if pcall(function() VirtualUser:Button1Up(Vector2.new()) end) then return true end
+        end
+    end
+    if ENABLE_CAMERA_FALLBACK then
+        cameraFallback()
+        return true
+    end
+    return false
+end
+
+-- ============================================================
+-- UI update
+-- ============================================================
+local function updateUI()
+    if enabled then
+        statusLabel.Text = "Status: Enabled"
+        statusLabel.TextColor3 = Color3.fromRGB(90, 220, 130)
+        toggleBtn.Text = "ON"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 170, 90)
+    else
+        statusLabel.Text = "Status: Disabled"
+        statusLabel.TextColor3 = Color3.fromRGB(220, 90, 90)
+        toggleBtn.Text = "OFF"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(90, 90, 100)
+    end
+    camBtn.Text = "Cam: " .. (ENABLE_CAMERA_FALLBACK and "ON" or "OFF")
+    camBtn.BackgroundColor3 = ENABLE_CAMERA_FALLBACK and Color3.fromRGB(80, 130, 200) or Color3.fromRGB(60, 60, 75)
+    countLabel.Text = "Triggers: " .. tostring(triggerCount)
+end
+
+-- ============================================================
+-- Idled
+-- ============================================================
+local function onIdled()
+    if not enabled then return end
+    local now = os.clock()
+    if now - lastTrigger < SHORT_THROTTLE then return end
+    lastTrigger = now
+    triggerCount = triggerCount + 1
+    print("[AntiAFK] triggered")
+    updateUI()
+    if not performClick() then
+        print("[AntiAFK] click failed")
+    end
+end
+
+-- ============================================================
+-- Stop
+-- ============================================================
+local function stop()
+    if idledConnection then idledConnection:Disconnect(); idledConnection = nil end
+    if keyConnection then keyConnection:Disconnect(); keyConnection = nil end
+    env.__XENO_ANTIAFK_LOADED = nil
+    _G.__XENO_ANTIAFK_LOADED = nil
+    env.__XENO_ANTIAFK_STOP = nil
+    print("[AntiAFK] stopped")
+    pcall(function() screenGui:Destroy() end)
+end
+
+-- ============================================================
+-- Connections
+-- ============================================================
+if LocalPlayer then
+    idledConnection = LocalPlayer.Idled:Connect(onIdled)
+else
+    print("[AntiAFK] LocalPlayer unavailable")
+end
+
+toggleBtn.MouseButton1Click:Connect(function()
+    enabled = not enabled
+    updateUI()
+    print("[AntiAFK] " .. (enabled and "enabled" or "disabled"))
+    notify("AntiAFK", enabled and "Enabled" or "Disabled")
+end)
+
+camBtn.MouseButton1Click:Connect(function()
+    ENABLE_CAMERA_FALLBACK = not ENABLE_CAMERA_FALLBACK
+    updateUI()
+    print("[AntiAFK] camera fallback " .. (ENABLE_CAMERA_FALLBACK and "on" or "off"))
+end)
+
+stopBtn.MouseButton1Click:Connect(stop)
+
+-- ============================================================
+-- Drag
+-- ============================================================
+local dragging = false
+local dragStart, startPos
+
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- ============================================================
+-- RightShift toggle
+-- ============================================================
+keyConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        enabled = not enabled
+        updateUI()
+        print("[AntiAFK] " .. (enabled and "enabled" or "disabled"))
+        notify("AntiAFK", enabled and "Enabled" or "Disabled")
+    end
+end)
+
+env.__XENO_ANTIAFK_STOP = stop
+
+updateUI()
+print("[AntiAFK] loaded")
+notify("AntiAFK", "Loaded")
