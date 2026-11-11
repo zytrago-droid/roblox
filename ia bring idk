@@ -1,0 +1,363 @@
+-- VISIT SYSTEM v3 — Xeno-tuned — multi-mode bring + hooked noclip
+-- N=stop | G=action all | L=loop | K=noclip | Ctrl+wheel=scale
+-- modes: VISUAL (illusion locale, non répliqué) | NETWORK (ownership, denied si non-owned) | VISIT (self-tp)
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local HttpService      = game:GetService("HttpService")
+
+local SAVE_FILE = "visit_v3.json"
+local SaveData  = {}
+local function loadSave() if not readfile then return end pcall(function() if isfile and not isfile(SAVE_FILE) then return end local r=readfile(SAVE_FILE) if type(r)~="string" or r=="" then return end local d=HttpService:JSONDecode(r) if type(d)=="table" then SaveData=d end end) end
+local function writeSave() if not writefile then return end pcall(function() writefile(SAVE_FILE,HttpService:JSONEncode(SaveData)) end) end
+loadSave()
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+local CONFIG = {
+    STOP_KEY=Enum.KeyCode.N, ACTION_ALL_KEY=Enum.KeyCode.G, LOOP_KEY=Enum.KeyCode.L, NOCLIP_KEY=Enum.KeyCode.K,
+    PANEL_WIDTH=320, PANEL_HEIGHT=460, MIN_WIDTH=260, MIN_HEIGHT=320, ROW_HEIGHT=50, THUMB_SIZE=36,
+    BEHIND_OFFSET=2.5, Y_OFFSET=0, UI_SCALE_STEP=0.08, UI_SCALE_MIN=0.6, UI_SCALE_MAX=1.8,
+    FOLLOW_HZ=30, ACTION_ALL_WAIT=3.0, TELEPORT_COOLDOWN=0.15, MAX_BRING_DIST=200,
+    BRING_MODE="VISUAL", FALLBACK_THUMB="https://www.roblox.com/headshot-thumbnail/image?userId=%d&width=420&height=420&format=png",
+}
+
+local THEME = {
+    BG=Color3.fromRGB(24,24,27), HEADER=Color3.fromRGB(18,18,20), ROW=Color3.fromRGB(32,32,36),
+    ROW_HOVER=Color3.fromRGB(45,45,50), ROW_ACTIVE=Color3.fromRGB(40,80,50), TEXT=Color3.fromRGB(230,230,230),
+    SUBTEXT=Color3.fromRGB(160,160,170), ACCENT=Color3.fromRGB(114,137,218), DANGER=Color3.fromRGB(237,66,69),
+    SUCCESS=Color3.fromRGB(87,242,135), MODE_ON=Color3.fromRGB(80,120,200)
+}
+
+local CAPS = {
+    hookmetamethod = type(hookmetamethod) == "function",
+    checkcaller    = type(checkcaller) == "function",
+    setnetworkowner = (function()
+        local ok, has = pcall(function()
+            local p = Instance.new("Part")
+            local h = type(p.SetNetworkOwner) == "function"
+            p:Destroy()
+            return h
+        end)
+        return ok and has == true
+    end)(),
+}
+
+local noclipBtn, loopBtn, actionAllBtn, modeBtns = nil, nil, nil, {}
+local panelGui, mainFrame, listFrame, statusLabel, uiScale, searchBox
+local function now() return workspace:GetServerTimeNow() end
+
+if getgenv and getgenv().__VISIT_V3_LOADED then pcall(getgenv().__VISIT_V3_CLEANUP) end
+
+local thumbnailCache, playerRows = {}, {}
+local followTarget, lastFollowTick = nil, 0
+local actionAllActive, actionAllLoop, actionAllThread = false, false, nil
+local noclipEnabled, lastTeleport = false, 0
+local noclipConnection, charAddedConnection, heartbeatConnection = nil, nil, nil
+local processedParts, originalCanCollide, partConnections = setmetatable({},{__mode="k"}), setmetatable({},{__mode="k"}), {}
+local canCollideCache, noclipHookInstalled = {}, false
+
+local function setStatus(t,err) if statusLabel then statusLabel.Text=t statusLabel.TextColor3=err and THEME.DANGER or THEME.SUBTEXT end end
+local function getThumb(id) if thumbnailCache[id] then return thumbnailCache[id] end local ok,u=pcall(function() return Players:GetUserThumbnailAsync(id,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size420x420) end) if not ok or type(u)~="string" or u=="" then u=string.format(CONFIG.FALLBACK_THUMB,id) end thumbnailCache[id]=u return u end
+local function getTargetHRP(p) if not p then return nil,"nil" end local c=p.Character if not c or c.Parent~=workspace then return nil,"no char" end local h=c:FindFirstChildOfClass("Humanoid") if not h or h.Health<=0 then return nil,"dead" end local r=c:FindFirstChild("HumanoidRootPart") if not r then return nil,"no hrp" end return r end
+local function getMyHRP() local c=LocalPlayer.Character if not c or c.Parent~=workspace then return nil end local r=c:FindFirstChild("HumanoidRootPart") local h=c:FindFirstChildOfClass("Humanoid") if not r or not h or h.Health<=0 then return nil end return r end
+
+local function installNoclipHook()
+    if noclipHookInstalled or not CAPS.hookmetamethod or not CAPS.checkcaller then return false end
+    local ok1 = pcall(function()
+        local OldIndex
+        OldIndex = hookmetamethod(game, "__index", function(self, key)
+            if key=="CanCollide" and not checkcaller() and canCollideCache[self]~=nil then return canCollideCache[self] end
+            return OldIndex(self, key)
+        end)
+    end)
+    local ok2 = pcall(function()
+        local OldNewIndex
+        OldNewIndex = hookmetamethod(game, "__newindex", function(self, key, val)
+            if key=="CanCollide" and not checkcaller() and canCollideCache[self]~=nil then return end
+            return OldNewIndex(self, key, val)
+        end)
+    end)
+    noclipHookInstalled = ok1 or ok2
+    return ok1 and ok2
+end
+
+local function lockPart(part)
+    if not part:IsA("BasePart") or processedParts[part] then return end
+    processedParts[part]=true
+    originalCanCollide[part]=part.CanCollide
+    canCollideCache[part]=part.CanCollide
+    part.CanCollide=false
+    if not partConnections[part] then
+        partConnections[part]=part:GetPropertyChangedSignal("CanCollide"):Connect(function()
+            if noclipEnabled and part.CanCollide then part.CanCollide=false end
+        end)
+    end
+end
+
+local function scanCharacter(ch) if not ch then return end for _,d in ipairs(ch:GetDescendants()) do lockPart(d) end end
+local function enforceNoclip()
+    if not noclipEnabled then return end
+    local c=LocalPlayer.Character if not c or not c.Parent then return end
+    for _,p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") and p.CanCollide then p.CanCollide=false end end
+end
+
+local function enableNoclip()
+    if noclipEnabled then return end
+    noclipEnabled=true
+    scanCharacter(LocalPlayer.Character)
+    installNoclipHook()
+    enforceNoclip()
+    noclipConnection=RunService.Stepped:Connect(enforceNoclip)
+    if noclipBtn then noclipBtn.TextColor3=THEME.SUCCESS; TweenService:Create(noclipBtn,TweenInfo.new(.2),{BackgroundColor3=Color3.fromRGB(30,50,35)}):Play() end
+    setStatus(noclipHookInstalled and "noclip: hook active" or "noclip: stepped fallback", false)
+end
+
+local function disableNoclip()
+    if not noclipEnabled then return end
+    noclipEnabled=false
+    if noclipConnection then noclipConnection:Disconnect(); noclipConnection=nil end
+    for _,c in pairs(partConnections) do pcall(function() c:Disconnect() end) end
+    partConnections={}
+    local ch=LocalPlayer.Character
+    if ch then for _,p in ipairs(ch:GetDescendants()) do if p:IsA("BasePart") then local o=originalCanCollide[p] p.CanCollide=(o~=nil) and o or (p.Name~="HumanoidRootPart") end end end
+    processedParts=setmetatable({},{__mode="k"}); originalCanCollide=setmetatable({},{__mode="k"}); canCollideCache={}
+    if noclipBtn then noclipBtn.TextColor3=THEME.SUBTEXT; TweenService:Create(noclipBtn,TweenInfo.new(.2),{BackgroundColor3=THEME.ROW}):Play() end
+end
+
+local function toggleNoclip() if noclipEnabled then disableNoclip() else enableNoclip() end SaveData.noclipEnabled=noclipEnabled writeSave() end
+
+charAddedConnection=LocalPlayer.CharacterAdded:Connect(function(nch)
+    for _,c in pairs(partConnections) do pcall(function() c:Disconnect() end) end
+    partConnections={} processedParts=setmetatable({},{__mode="k"}) originalCanCollide=setmetatable({},{__mode="k"}) canCollideCache={}
+    if noclipEnabled then task.wait(0.1) scanCharacter(nch) enforceNoclip() end
+end)
+
+--============ BRING MODES v3.1 ============
+local visualLoopConn = nil
+local visualTarget = nil
+
+local function stopVisualPull()
+    if visualLoopConn then
+        visualLoopConn:Disconnect()
+        visualLoopConn = nil
+    end
+    visualTarget = nil
+end
+
+local function startVisualPull(targetPlayer)
+    stopVisualPull()
+    visualTarget = targetPlayer
+    visualLoopConn = RunService.RenderStepped:Connect(function()
+        local t = visualTarget
+        if not t or not t.Parent then stopVisualPull() return end
+        local tHRP = getTargetHRP(t)
+        local myHRP = getMyHRP()
+        if not tHRP or not myHRP then return end
+        local dest = myHRP.CFrame * CFrame.new(0, 0, -4)
+        pcall(function() tHRP.CFrame = dest end)
+    end)
+    return true
+end
+
+local function bringVisual(targetPlayer)
+    local tHRP, err = getTargetHRP(targetPlayer)
+    if not tHRP then return false, err end
+    local myHRP = getMyHRP()
+    if not myHRP then return false, "self dead" end
+    local dist = (tHRP.Position - myHRP.Position).Magnitude
+    if dist > CONFIG.MAX_BRING_DIST then return false, "too far" end
+    startVisualPull(targetPlayer)
+    return true, "visual-pull-active"
+end
+
+local function bringNetwork(targetPlayer)
+    local tHRP, err = getTargetHRP(targetPlayer)
+    if not tHRP then return false, err end
+
+    local owner = nil
+    pcall(function() owner = tHRP:GetNetworkOwner() end)
+
+    if owner == LocalPlayer then
+        local myHRP = getMyHRP()
+        if myHRP then
+            local dest = myHRP.CFrame * CFrame.new(0, 0, -4)
+            pcall(function() tHRP.CFrame = dest end)
+            return true, "owned-direct"
+        end
+    end
+
+    local ok = pcall(function() tHRP:SetNetworkOwner(LocalPlayer) end)
+    if ok then
+        local owner2 = nil
+        pcall(function() owner2 = tHRP:GetNetworkOwner() end)
+        if owner2 == LocalPlayer then
+            local myHRP = getMyHRP()
+            if myHRP then
+                local dest = myHRP.CFrame * CFrame.new(0, 0, -4)
+                pcall(function() tHRP.CFrame = dest end)
+            end
+            return true, "owned-acquired"
+        end
+    end
+
+    startVisualPull(targetPlayer)
+    return true, "fallback-visual"
+end
+
+local function visitBehind(targetPlayer)
+    local tHRP,err=getTargetHRP(targetPlayer) if not tHRP then return false,err end
+    local myHRP=getMyHRP() if not myHRP then return false,"self dead" end
+    local t=now() if t-lastTeleport<CONFIG.TELEPORT_COOLDOWN then return false,"cooldown" end
+    local myChar=LocalPlayer.Character if not myChar then return false,"self gone" end
+    local dest=tHRP.CFrame*CFrame.new(0,CONFIG.Y_OFFSET,CONFIG.BEHIND_OFFSET)
+    local ok=pcall(function() if myChar.PivotTo then myChar:PivotTo(dest) else myHRP.CFrame=dest end end)
+    if ok then lastTeleport=t pcall(function() myHRP.AssemblyLinearVelocity=Vector3.zero end) end
+    return ok
+end
+
+local function applyBring(targetPlayer)
+    local mode=CONFIG.BRING_MODE
+    if mode=="NETWORK" then local ok,err=bringNetwork(targetPlayer) if ok then return true end if err~="no ownership api" and err~="ownership denied" then return false,err end end
+    if mode=="VISUAL" or mode=="NETWORK" then local ok,err=bringVisual(targetPlayer) if ok then return true end if mode=="VISUAL" then return false,err end end
+    return visitBehind(targetPlayer)
+end
+
+local function updateRowState(p,f)
+    local r=playerRows[p] if not r or not r.Parent then return end local b=r:FindFirstChild("ActionBtn")
+    if f then TweenService:Create(r,TweenInfo.new(.2),{BackgroundColor3=THEME.ROW_ACTIVE}):Play() if b then b.Text="stop" TweenService:Create(b,TweenInfo.new(.2),{BackgroundColor3=THEME.DANGER}):Play() end
+    else TweenService:Create(r,TweenInfo.new(.2),{BackgroundColor3=THEME.ROW}):Play() if b then b.Text="action" TweenService:Create(b,TweenInfo.new(.2),{BackgroundColor3=THEME.ACCENT}):Play() end end
+end
+
+local function stopFollow(reason) stopVisualPull() if not followTarget then return end local p=followTarget followTarget=nil updateRowState(p,false) if reason then setStatus(reason,true) end end
+local function startFollow(p) local ok,err=applyBring(p) if not ok and err~="cooldown" then setStatus("fail: "..(err or "?"),true) return false end if followTarget and followTarget~=p then updateRowState(followTarget,false) end followTarget=p lastFollowTick=0 updateRowState(p,true) setStatus("follow ["..CONFIG.BRING_MODE.."]: "..p.DisplayName,false) return true end
+
+local FOLLOW_INTERVAL=math.max(1/CONFIG.FOLLOW_HZ,CONFIG.TELEPORT_COOLDOWN)
+heartbeatConnection=RunService.Heartbeat:Connect(function()
+    if not followTarget then return end
+    local t=now() if t-lastFollowTick<FOLLOW_INTERVAL then return end lastFollowTick=t
+    if not followTarget.Parent then stopFollow("target left") return end
+    local ok,err=applyBring(followTarget) if not ok and err~="cooldown" then stopFollow("follow: "..(err or "lost")) end
+end)
+
+local function cancelActionAll() if actionAllThread then pcall(function() task.cancel(actionAllThread) end) actionAllThread=nil end actionAllActive=false end
+
+local function actionAll()
+    if actionAllActive then cancelActionAll() setStatus("action all stopped",false) return end
+    if followTarget then stopFollow(nil) end
+    local function valid() local l={} for _,p in ipairs(Players:GetPlayers()) do if p~=LocalPlayer and getTargetHRP(p) then table.insert(l,p) end end return l end
+    local targets=valid() if #targets==0 then setStatus("no valid targets",true) return end
+    actionAllActive=true setStatus("action all ["..CONFIG.BRING_MODE.."] running",false)
+    actionAllThread=task.spawn(function()
+        while actionAllActive do
+            for _,p in ipairs(targets) do
+                if not actionAllActive then break end
+                if getTargetHRP(p) then
+                    local deadline=now()+CONFIG.ACTION_ALL_WAIT
+                    while now()<deadline and actionAllActive do applyBring(p) setStatus("action: "..p.DisplayName,false) task.wait(CONFIG.TELEPORT_COOLDOWN) end
+                end
+            end
+            if actionAllLoop and actionAllActive then targets=valid() task.wait(0.5) else break end
+        end
+        actionAllActive=false actionAllThread=nil setStatus("action all done",false)
+    end)
+end
+
+local function createHover(btn,norm,hover) btn.MouseEnter:Connect(function() TweenService:Create(btn,TweenInfo.new(.15),{BackgroundColor3=hover}):Play() end) btn.MouseLeave:Connect(function() TweenService:Create(btn,TweenInfo.new(.15),{BackgroundColor3=norm}):Play() end) end
+
+local function onRowClick(p,row) if actionAllActive then cancelActionAll() end if followTarget==p then stopFollow("follow stopped") return end startFollow(p) end
+
+local function stopAll() stopVisualPull() if followTarget then stopFollow(nil) end cancelActionAll() actionAllLoop=false if noclipEnabled then disableNoclip() end if loopBtn then loopBtn.TextColor3=THEME.SUBTEXT end setStatus("all off",false) end
+
+local function createRow(p)
+    if p==LocalPlayer or playerRows[p] then return end
+    local row=Instance.new("Frame") row.Name="Row_"..tostring(p.UserId) row.Size=UDim2.new(1,-12,0,CONFIG.ROW_HEIGHT) row.BackgroundColor3=THEME.ROW row.BorderSizePixel=0 row.Parent=listFrame
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,6)
+    local thumb=Instance.new("ImageLabel") thumb.Size=UDim2.fromOffset(CONFIG.THUMB_SIZE,CONFIG.THUMB_SIZE) thumb.Position=UDim2.fromOffset(6,7) thumb.BackgroundColor3=THEME.HEADER thumb.BorderSizePixel=0 thumb.ZIndex=2 thumb.Parent=row Instance.new("UICorner",thumb).CornerRadius=UDim.new(0,4)
+    local nl=Instance.new("TextLabel") nl.Size=UDim2.new(1,-CONFIG.THUMB_SIZE-90,0,16) nl.Position=UDim2.fromOffset(CONFIG.THUMB_SIZE+14,9) nl.BackgroundTransparency=1 nl.Font=Enum.Font.GothamMedium nl.TextSize=13 nl.TextColor3=THEME.TEXT nl.TextXAlignment=Enum.TextXAlignment.Left nl.Text=p.DisplayName nl.ZIndex=2 nl.Parent=row
+    local al=Instance.new("TextLabel") al.Size=UDim2.new(1,-CONFIG.THUMB_SIZE-90,0,14) al.Position=UDim2.fromOffset(CONFIG.THUMB_SIZE+14,25) al.BackgroundTransparency=1 al.Font=Enum.Font.Gotham al.TextSize=11 al.TextColor3=THEME.SUBTEXT al.TextXAlignment=Enum.TextXAlignment.Left al.Text="@"..p.Name al.ZIndex=2 al.Parent=row
+    local btn=Instance.new("TextButton") btn.Name="ActionBtn" btn.Size=UDim2.new(0,64,0,26) btn.Position=UDim2.new(1,-72,0.5,-13) btn.BackgroundColor3=THEME.ACCENT btn.BorderSizePixel=0 btn.Font=Enum.Font.GothamBold btn.TextSize=11 btn.TextColor3=Color3.fromRGB(255,255,255) btn.Text="action" btn.ZIndex=3 btn.Parent=row Instance.new("UICorner",btn).CornerRadius=UDim.new(0,4)
+    createHover(btn,THEME.ACCENT,THEME.ACCENT:Lerp(Color3.new(1,1,1),.2))
+    local cc=Instance.new("TextButton") cc.Size=UDim2.new(1,0,1,0) cc.BackgroundTransparency=1 cc.Text="" cc.AutoButtonColor=false cc.ZIndex=2 cc.Parent=row
+    cc.MouseEnter:Connect(function() if followTarget~=p then TweenService:Create(row,TweenInfo.new(.15),{BackgroundColor3=THEME.ROW_HOVER}):Play() end end)
+    cc.MouseLeave:Connect(function() if followTarget~=p then TweenService:Create(row,TweenInfo.new(.15),{BackgroundColor3=THEME.ROW}):Play() end end)
+    task.spawn(function() local u=getThumb(p.UserId) if thumb and thumb.Parent then pcall(function() thumb.Image=u end) end end)
+    btn.MouseButton1Click:Connect(function() onRowClick(p,row) end) cc.MouseButton1Click:Connect(function() onRowClick(p,row) end)
+    playerRows[p]=row
+end
+
+local function applyFilter()
+    if not searchBox or not listFrame then return end local q=string.lower(searchBox.Text)
+    for p,r in pairs(playerRows) do if r and r.Parent then if q=="" then r.Visible=true else local n=string.find(string.lower(p.Name),q,1,true) local d=string.find(string.lower(p.DisplayName),q,1,true) r.Visible=(n~=nil) or (d~=nil) end end end
+end
+
+local function setMode(m) CONFIG.BRING_MODE=m for k,b in pairs(modeBtns) do b.TextColor3=(k==m) and THEME.MODE_ON or THEME.SUBTEXT end setStatus("mode: "..m,false) SaveData.bringMode=m writeSave() end
+
+local function buildUI()
+    panelGui=Instance.new("ScreenGui") panelGui.Name="VisitUI" panelGui.ResetOnSpawn=false panelGui.IgnoreGuiInset=true panelGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling panelGui.Parent=PlayerGui
+    mainFrame=Instance.new("Frame") mainFrame.AnchorPoint=Vector2.new(1,.5) mainFrame.Size=UDim2.fromOffset(CONFIG.PANEL_WIDTH,CONFIG.PANEL_HEIGHT) mainFrame.Position=UDim2.new(1,-20,.5,0) mainFrame.BackgroundColor3=THEME.BG mainFrame.BorderSizePixel=0 mainFrame.Active=true mainFrame.Parent=panelGui
+    Instance.new("UICorner",mainFrame).CornerRadius=UDim.new(0,10) local st=Instance.new("UIStroke",mainFrame) st.Color=Color3.fromRGB(60,60,65) st.Thickness=1
+    local hd=Instance.new("Frame") hd.Size=UDim2.new(1,0,0,40) hd.BackgroundColor3=THEME.HEADER hd.BorderSizePixel=0 hd.Parent=mainFrame Instance.new("UICorner",hd).CornerRadius=UDim.new(0,10)
+    local ti=Instance.new("TextLabel") ti.Size=UDim2.new(1,-60,1,0) ti.Position=UDim2.fromOffset(15,0) ti.BackgroundTransparency=1 ti.Font=Enum.Font.GothamBold ti.TextSize=14 ti.TextColor3=THEME.TEXT ti.TextXAlignment=Enum.TextXAlignment.Left ti.Text="VISIT SYSTEM v3" ti.Parent=hd
+    local drag,dS,stPos=false,nil,nil
+    hd.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=true dS=i.Position stPos=mainFrame.Position end end)
+    UserInputService.InputChanged:Connect(function(i) if drag and i.UserInputType==Enum.UserInputType.MouseMovement then local d=i.Position-dS mainFrame.Position=UDim2.new(stPos.X.Scale,stPos.X.Offset+d.X,stPos.Y.Scale,stPos.Y.Offset+d.Y) end end)
+    UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end end)
+    local cb=Instance.new("TextButton") cb.Size=UDim2.new(0,26,0,26) cb.Position=UDim2.new(1,-34,0,7) cb.BackgroundColor3=THEME.ROW cb.BorderSizePixel=0 cb.Font=Enum.Font.GothamBold cb.TextSize=14 cb.TextColor3=THEME.SUBTEXT cb.Text="X" cb.Parent=hd Instance.new("UICorner",cb).CornerRadius=UDim.new(0,6) cb.MouseButton1Click:Connect(function() stopAll() mainFrame.Visible=false end)
+    local ct=Instance.new("Frame") ct.Size=UDim2.new(1,-20,0,30) ct.Position=UDim2.fromOffset(10,46) ct.BackgroundTransparency=1 ct.Parent=mainFrame local cl=Instance.new("UIListLayout",ct) cl.FillDirection=Enum.FillDirection.Horizontal cl.Padding=UDim.new(0,5)
+    local function cbtn(t,o) local b=Instance.new("TextButton") b.Size=UDim2.new(0,70,1,0) b.BackgroundColor3=THEME.ROW b.BorderSizePixel=0 b.Font=Enum.Font.GothamBold b.TextSize=10 b.TextColor3=THEME.SUBTEXT b.Text=t b.LayoutOrder=o b.Parent=ct Instance.new("UICorner",b).CornerRadius=UDim.new(0,6) createHover(b,THEME.ROW,THEME.ROW_HOVER) return b end
+    actionAllBtn=cbtn("ALL [G]",1) loopBtn=cbtn("LOOP [L]",2) noclipBtn=cbtn("NOCLIP [K]",3)
+    actionAllBtn.MouseButton1Click:Connect(function() actionAll() actionAllBtn.TextColor3=actionAllActive and THEME.ACCENT or THEME.SUBTEXT end)
+    loopBtn.MouseButton1Click:Connect(function() actionAllLoop=not actionAllLoop loopBtn.TextColor3=actionAllLoop and THEME.SUCCESS or THEME.SUBTEXT setStatus("loop: "..(actionAllLoop and "on" or "off"),false) SaveData.actionAllLoop=actionAllLoop writeSave() end)
+    noclipBtn.MouseButton1Click:Connect(toggleNoclip)
+    local mr=Instance.new("Frame") mr.Size=UDim2.new(1,-20,0,26) mr.Position=UDim2.fromOffset(10,80) mr.BackgroundTransparency=1 mr.Parent=mainFrame local ml=Instance.new("UIListLayout",mr) ml.FillDirection=Enum.FillDirection.Horizontal ml.Padding=UDim.new(0,4)
+    for _,m in ipairs({"VISUAL","NETWORK","VISIT"}) do local b=Instance.new("TextButton") b.Size=UDim2.new(0,96,1,0) b.BackgroundColor3=THEME.ROW b.BorderSizePixel=0 b.Font=Enum.Font.GothamBold b.TextSize=10 b.TextColor3=(m==CONFIG.BRING_MODE) and THEME.MODE_ON or THEME.SUBTEXT b.Text=m b.Parent=mr Instance.new("UICorner",b).CornerRadius=UDim.new(0,6) createHover(b,THEME.ROW,THEME.ROW_HOVER) modeBtns[m]=b b.MouseButton1Click:Connect(function() setMode(m) end) end
+    searchBox=Instance.new("TextBox") searchBox.Size=UDim2.new(1,-20,0,26) searchBox.Position=UDim2.fromOffset(10,112) searchBox.BackgroundColor3=THEME.ROW searchBox.BorderSizePixel=0 searchBox.Font=Enum.Font.Gotham searchBox.TextSize=12 searchBox.TextColor3=THEME.TEXT searchBox.PlaceholderText="search player..." searchBox.PlaceholderColor3=THEME.SUBTEXT searchBox.Text="" searchBox.ClearTextOnFocus=false searchBox.Parent=mainFrame Instance.new("UICorner",searchBox).CornerRadius=UDim.new(0,6) searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter)
+    listFrame=Instance.new("ScrollingFrame") listFrame.Size=UDim2.new(1,-16,1,-186) listFrame.Position=UDim2.fromOffset(8,144) listFrame.BackgroundTransparency=1 listFrame.BorderSizePixel=0 listFrame.CanvasSize=UDim2.new(0,0,0,0) listFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y listFrame.ScrollBarThickness=4 listFrame.ScrollBarImageColor3=Color3.fromRGB(80,80,85) listFrame.Parent=mainFrame local ll=Instance.new("UIListLayout",listFrame) ll.Padding=UDim.new(0,6)
+    statusLabel=Instance.new("TextLabel") statusLabel.Size=UDim2.new(1,-20,0,20) statusLabel.Position=UDim2.new(0,10,1,-28) statusLabel.BackgroundTransparency=1 statusLabel.Font=Enum.Font.GothamMedium statusLabel.TextSize=11 statusLabel.TextColor3=THEME.SUBTEXT statusLabel.TextXAlignment=Enum.TextXAlignment.Left statusLabel.Text="ready." statusLabel.Parent=mainFrame
+    uiScale=Instance.new("UIScale") uiScale.Scale=1 uiScale.Parent=mainFrame
+    if SaveData.actionAllLoop then actionAllLoop=true if loopBtn then loopBtn.TextColor3=THEME.SUCCESS end end
+    if SaveData.bringMode then setMode(SaveData.bringMode) end
+    if SaveData.noclipEnabled then enableNoclip() end
+    for _,p in ipairs(Players:GetPlayers()) do if p~=LocalPlayer then createRow(p) end end
+end
+
+local keybindConn=UserInputService.InputBegan:Connect(function(i,gp) if gp then return end local k=i.KeyCode
+    if k==CONFIG.STOP_KEY then stopAll()
+    elseif k==CONFIG.ACTION_ALL_KEY then actionAll()
+    elseif k==CONFIG.LOOP_KEY then actionAllLoop=not actionAllLoop if loopBtn then loopBtn.TextColor3=actionAllLoop and THEME.SUCCESS or THEME.SUBTEXT end
+    elseif k==CONFIG.NOCLIP_KEY then toggleNoclip() end
+end)
+
+local scaleConn=UserInputService.InputChanged:Connect(function(i,gp)
+    if gp or i.UserInputType~=Enum.UserInputType.MouseWheel then return end
+    if not UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then return end
+    if not (uiScale and uiScale:IsA("UIScale")) then return end
+    local d=i.Position.Z>0 and 1 or -1 uiScale.Scale=math.clamp(uiScale.Scale+d*CONFIG.UI_SCALE_STEP,CONFIG.UI_SCALE_MIN,CONFIG.UI_SCALE_MAX)
+end)
+
+local playerRemovingConn=Players.PlayerRemoving:Connect(function(p) if followTarget==p then stopFollow("target left") end local r=playerRows[p] if r then pcall(function() r:Destroy() end) playerRows[p]=nil end end)
+
+if getgenv then
+    getgenv().__VISIT_V3_CLEANUP=function()
+        stopVisualPull()
+        pcall(stopAll)
+        if heartbeatConnection then heartbeatConnection:Disconnect() heartbeatConnection=nil end
+        if charAddedConnection then charAddedConnection:Disconnect() charAddedConnection=nil end
+        if playerRemovingConn then playerRemovingConn:Disconnect() playerRemovingConn=nil end
+        if keybindConn then keybindConn:Disconnect() keybindConn=nil end
+        if scaleConn then scaleConn:Disconnect() scaleConn=nil end
+        if noclipConnection then noclipConnection:Disconnect() noclipConnection=nil end
+        for _,c in pairs(partConnections) do pcall(function() c:Disconnect() end) end partConnections={}
+        if panelGui then pcall(function() panelGui:Destroy() end) panelGui=nil end
+        if getgenv().__VISIT_V3_LOADED then getgenv().__VISIT_V3_LOADED=nil end
+    end
+    getgenv().__VISIT_V3_LOADED=true
+end
+
+buildUI()
+Players.PlayerAdded:Connect(function(p) if p~=LocalPlayer then createRow(p) end end)
+print("[visit v3] loaded — caps: hook="..tostring(CAPS.hookmetamethod).." ownership="..tostring(CAPS.setnetworkowner).." | N=stop G=all L=loop K=noclip")
